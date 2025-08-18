@@ -22,6 +22,209 @@ export default function CesiumViewer() {
   // Add state to store the image's aspect ratio
   const [imageAspectRatio, setImageAspectRatio] = useState<number>(1);
 
+  // Add state for resize handles and interaction
+  const [showResizeHandles, setShowResizeHandles] = useState<boolean>(false);
+  const [isResizing, setIsResizing] = useState<boolean>(false);
+  const [resizeStartPoint, setResizeStartPoint] = useState<any>(null);
+  const [resizeStartRect, setResizeStartRect] = useState<any>(null);
+
+  // Function to show resize handles when image is loaded
+  const showResizeHandlesForImage = () => {
+    if (imageBillboard?.type === 'imagery') {
+      setShowResizeHandles(true);
+    }
+  };
+
+  // Function to hide resize handles
+  const hideResizeHandles = () => {
+    setShowResizeHandles(false);
+    setIsResizing(false);
+  };
+
+  // Function to handle resize start
+  const startResize = (handle: string, event: any) => {
+    if (imageBillboard?.type !== 'imagery' || !cesiumRef.current) return;
+    
+    setIsResizing(true);
+    setResizeStartPoint(event);
+    setResizeStartRect({ ...imageBillboard.layer.rectangle });
+    
+    // Add event listeners for dragging
+    document.addEventListener('mousemove', handleResizeMove);
+    document.addEventListener('mouseup', stopResize);
+  };
+
+  // Function to handle resize movement
+  const handleResizeMove = (event: MouseEvent) => {
+    if (!isResizing || !resizeStartPoint || !resizeStartRect || !cesiumRef.current || imageBillboard?.type !== 'imagery') return;
+    
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+
+    // Convert mouse position to world coordinates
+    const mousePosition = new cesiumRef.current.Cartesian2(event.clientX, event.clientY);
+    const pickedPosition = viewer.camera.pickEllipsoid(mousePosition, viewer.scene.globe.ellipsoid);
+    
+    if (!pickedPosition) return;
+    
+    const cartographic = cesiumRef.current.Cartographic.fromCartesian(pickedPosition);
+    const longitude = cesiumRef.current.Math.toDegrees(cartographic.longitude);
+    const latitude = cesiumRef.current.Math.toDegrees(cartographic.latitude);
+    
+    // Calculate new rectangle based on which handle was dragged
+    let newRect;
+    const deltaLon = longitude - cesiumRef.current.Math.toDegrees(cesiumRef.current.Cartographic.fromCartesian(resizeStartPoint.position).longitude);
+    const deltaLat = latitude - cesiumRef.current.Math.toDegrees(cesiumRef.current.Cartographic.fromCartesian(resizeStartPoint.position).latitude);
+    
+    if (resizeStartPoint.handle === 'corner') {
+      // Uniform scaling from corner
+      const scaleFactor = 1 + Math.max(Math.abs(deltaLon), Math.abs(deltaLat)) / 0.01;
+      const centerLon = (resizeStartRect.west + resizeStartRect.east) / 2;
+      const centerLat = (resizeStartRect.south + resizeStartRect.north) / 2;
+      const halfWidth = (resizeStartRect.east - resizeStartRect.west) / 2 * scaleFactor;
+      const halfHeight = (resizeStartRect.north - resizeStartRect.south) / 2 * scaleFactor;
+      
+      newRect = cesiumRef.current.Rectangle.fromDegrees(
+        centerLon - halfWidth,
+        centerLat - halfHeight,
+        centerLon + halfWidth,
+        centerLat + halfHeight
+      );
+    } else if (resizeStartPoint.handle === 'edge') {
+      // Non-uniform scaling from edge
+      const edge = resizeStartPoint.edge;
+      if (edge === 'north' || edge === 'south') {
+        newRect = cesiumRef.current.Rectangle.fromDegrees(
+          resizeStartRect.west,
+          edge === 'north' ? resizeStartRect.south : resizeStartRect.south + deltaLat,
+          resizeStartRect.east,
+          edge === 'north' ? resizeStartRect.north + deltaLat : resizeStartRect.north
+        );
+      } else {
+        newRect = cesiumRef.current.Rectangle.fromDegrees(
+          edge === 'east' ? resizeStartRect.west : resizeStartRect.west + deltaLon,
+          resizeStartRect.south,
+          edge === 'east' ? resizeStartRect.east + deltaLon : resizeStartRect.east,
+          resizeStartRect.north
+        );
+      }
+    }
+    
+    if (newRect) {
+      imageBillboard.layer.rectangle = newRect;
+      // Update position controls to reflect new position
+      updatePositionControls(newRect);
+    }
+  };
+
+  // Function to stop resizing
+  const stopResize = () => {
+    setIsResizing(false);
+    setResizeStartPoint(null);
+    setResizeStartRect(null);
+    document.removeEventListener('mousemove', handleResizeMove);
+    document.removeEventListener('mouseup', stopResize);
+  };
+
+  // Add resize handles to the map
+  useEffect(() => {
+    if (!showResizeHandles || imageBillboard?.type !== 'imagery' || !cesiumRef.current || !viewerRef.current) return;
+    
+    console.log('Creating resize handles...'); // Debug log
+    
+    const viewer = viewerRef.current;
+    const Cesium = cesiumRef.current;
+    
+    // Create resize handle entities
+    const rect = imageBillboard.layer.rectangle;
+    console.log('Image rectangle:', rect); // Debug log
+    const handles: any[] = [];
+    
+    // Corner handles (uniform scaling)
+    const corners = [
+      { position: Cesium.Cartesian3.fromDegrees(rect.west, rect.north), handle: 'corner', edge: 'nw' },
+      { position: Cesium.Cartesian3.fromDegrees(rect.east, rect.north), handle: 'corner', edge: 'ne' },
+      { position: Cesium.Cartesian3.fromDegrees(rect.east, rect.south), handle: 'corner', edge: 'se' },
+      { position: Cesium.Cartesian3.fromDegrees(rect.west, rect.south), handle: 'corner', edge: 'sw' }
+    ];
+    
+    // Edge handles (non-uniform scaling)
+    const edges = [
+      { position: Cesium.Cartesian3.fromDegrees((rect.west + rect.east) / 2, rect.north), handle: 'edge', edge: 'north' },
+      { position: Cesium.Cartesian3.fromDegrees(rect.east, (rect.south + rect.north) / 2), handle: 'edge', edge: 'east' },
+      { position: Cesium.Cartesian3.fromDegrees((rect.west + rect.east) / 2, rect.south), handle: 'edge', edge: 'south' },
+      { position: Cesium.Cartesian3.fromDegrees(rect.west, (rect.south + rect.north) / 2), handle: 'edge', edge: 'west' }
+    ];
+    
+    // Add corner handles
+    corners.forEach(({ position, handle, edge }) => {
+      const entity = viewer.entities.add({
+        position: position,
+        point: {
+          pixelOffset: new Cesium.Cartesian2(0, 0),
+          color: Cesium.Color.YELLOW,
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 3,
+          scale: 15,
+          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY
+        }
+      });
+      
+      handles.push({ entity, handle, edge, position });
+      console.log('Added corner handle:', edge, 'at position:', position); // Debug log
+    });
+    
+    // Add edge handles
+    edges.forEach(({ position, handle, edge }) => {
+      const entity = viewer.entities.add({
+        position: position,
+        point: {
+          pixelOffset: new Cesium.Cartesian2(0, 0),
+          color: Cesium.Color.ORANGE,
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 3,
+          scale: 12,
+          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY
+        }
+      });
+      
+      handles.push({ entity, handle, edge, position });
+      console.log('Added edge handle:', edge, 'at position:', position); // Debug log
+    });
+    
+    console.log('Total handles created:', handles.length); // Debug log
+    
+    // Add click event handler for resize handles
+    const clickHandler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+    clickHandler.setInputAction((event: any) => {
+      const pickedObject = viewer.scene.pick(event.position);
+      if (pickedObject && pickedObject.id) {
+        const handle = handles.find(h => h.entity === pickedObject.id);
+        if (handle) {
+          console.log('Handle clicked:', handle); // Debug log
+          startResize(handle.handle, { position: handle.position, handle: handle.handle, edge: handle.edge });
+        }
+      }
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    
+    // Cleanup function
+    return () => {
+      handles.forEach(handle => viewer.entities.remove(handle.entity));
+      clickHandler.destroy();
+    };
+  }, [showResizeHandles, imageBillboard]);
+
+  // Function to update handle positions when image moves
+  const updateHandlePositions = () => {
+    if (!showResizeHandles || imageBillboard?.type !== 'imagery' || !cesiumRef.current || !viewerRef.current) return;
+    
+    // Force re-render of handles by toggling showResizeHandles
+    setShowResizeHandles(false);
+    setTimeout(() => setShowResizeHandles(true), 100);
+  };
+
   // Init Cesium only when an image is chosen (your original intent)
   useEffect(() => {
     if (!imageFile) return;
@@ -150,6 +353,9 @@ export default function CesiumViewer() {
       setImageBillboard({ type: 'imagery', layer, url: imageUrl });
 
       viewer.camera.flyTo({ destination: rect, duration: 1.0 });
+      
+      // Show resize handles immediately after image is loaded
+      setShowResizeHandles(true);
     } catch (error: any) {
       console.error('convertImageToImageryLayerWith error:', error);
       // Don't alert during init; reserve alerts for explicit user actions
@@ -244,6 +450,10 @@ export default function CesiumViewer() {
         viewer.camera.flyTo({ destination: newImageRect, duration: 1.0 });
 
         if (postcodeInput) postcodeInput.value = postcode.toUpperCase();
+        
+        // Show resize handles after repositioning and update their positions
+        setShowResizeHandles(true);
+        setTimeout(() => updateHandlePositions(), 100);
       })
       .catch(error => {
         if (postcodeInput) postcodeInput.value = postcode;
@@ -319,49 +529,6 @@ export default function CesiumViewer() {
               </button>
             </div>
 
-            {/* Size Control */}
-            <div className="mb-2">
-              <label className="block text-xs font-medium text-gray-600 mb-1">
-                Image Size (degrees)
-              </label>
-              <div className="grid grid-cols-2 gap-2">
-                <input
-                  type="number"
-                  placeholder="Width"
-                  step="0.001"
-                  min="0.001"
-                  max="1.0"
-                  defaultValue="0.02"
-                  onChange={(e) => {
-                    const value = parseFloat(e.target.value);
-                    if (!isNaN(value) && value > 0) {
-                      window.imageSize = { width: value, height: value };
-                    }
-                  }}
-                  className="px-2 py-1 border border-gray-300 rounded text-xs"
-                />
-                <input
-                  type="number"
-                  placeholder="Height"
-                  step="0.001"
-                  min="0.001"
-                  max="1.0"
-                  defaultValue="0.02"
-                  onChange={(e) => {
-                    const value = parseFloat(e.target.value);
-                    if (!isNaN(value) && value > 0) {
-                      if (!window.imageSize) window.imageSize = { width: 0.02, height: 0.02 };
-                      window.imageSize.height = value;
-                    }
-                  }}
-                  className="px-2 py-1 border border-gray-300 rounded text-xs"
-                />
-              </div>
-              <p className="text-xs text-gray-500 mt-1">
-                Set the size of the image rectangle when centering on a postcode
-              </p>
-            </div>
-
             <p className="text-xs text-gray-500 mt-1">
               Enter a UK postcode and press Enter or click Center to position the image
             </p>
@@ -369,154 +536,32 @@ export default function CesiumViewer() {
               <p className="font-medium">Example postcodes:</p>
               <p>SW1A 1AA (Buckingham Palace), M1 1AA (Manchester), B1 1AA (Birmingham)</p>
             </div>
-          </div>
 
-          {/* Image Controls */}
-          {imageBillboard && (
-            <div className="space-y-4 border-t pt-4">
-              <h2 className="font-medium">Image Controls</h2>
-
-              <div className="space-y-3">
-                {imageBillboard.type === 'imagery' ? (
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 mb-1">Position & Size (Degrees)</label>
-                    <div className="grid grid-cols-2 gap-2 text-xs">
-                      <div>
-                        <label className="block text-gray-500">West</label>
-                        <input
-                          type="number"
-                          step="0.001"
-                          defaultValue="-0.01"
-                          onChange={(e) => {
-                            const value = parseFloat(e.target.value);
-                            if (!isNaN(value) && imageBillboard.layer && cesiumRef.current) {
-                              const currentRect = imageBillboard.layer.rectangle;
-                              const newRect = cesiumRef.current.Rectangle.fromDegrees(
-                                value, currentRect.south, currentRect.east, currentRect.north
-                              );
-                              imageBillboard.layer.rectangle = newRect;
-                            }
-                          }}
-                          className="w-full px-2 py-1 border border-gray-300 rounded text-xs"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-medium text-gray-600 mb-1">East</label>
-                        <input
-                          type="number"
-                          step="0.001"
-                          defaultValue="0.01"
-                          onChange={(e) => {
-                            const value = parseFloat(e.target.value);
-                            if (!isNaN(value) && imageBillboard.layer && cesiumRef.current) {
-                              const currentRect = imageBillboard.layer.rectangle;
-                              const newRect = cesiumRef.current.Rectangle.fromDegrees(
-                                currentRect.west, currentRect.south, value, currentRect.north
-                              );
-                              imageBillboard.layer.rectangle = newRect;
-                            }
-                          }}
-                          className="w-full px-2 py-1 border border-gray-300 rounded text-xs"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-medium text-gray-600 mb-1">South</label>
-                        <input
-                          type="number"
-                          step="0.001"
-                          defaultValue="-0.01"
-                          onChange={(e) => {
-                            const value = parseFloat(e.target.value);
-                            if (!isNaN(value) && imageBillboard.layer && cesiumRef.current) {
-                              const currentRect = imageBillboard.layer.rectangle;
-                              const newRect = cesiumRef.current.Rectangle.fromDegrees(
-                                currentRect.west, value, currentRect.east, currentRect.north
-                              );
-                              imageBillboard.layer.rectangle = newRect;
-                            }
-                          }}
-                          className="w-full px-2 py-1 border border-gray-300 rounded text-xs"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-medium text-gray-600 mb-1">North</label>
-                        <input
-                          type="number"
-                          step="0.001"
-                          defaultValue="0.01"
-                          onChange={(e) => {
-                            const value = parseFloat(e.target.value);
-                            if (!isNaN(value) && imageBillboard.layer && cesiumRef.current) {
-                              const currentRect = imageBillboard.layer.rectangle;
-                              const newRect = cesiumRef.current.Rectangle.fromDegrees(
-                                currentRect.west, currentRect.south, currentRect.east, value
-                              );
-                              imageBillboard.layer.rectangle = newRect;
-                            }
-                          }}
-                          className="w-full px-2 py-1 border border-gray-300 rounded text-xs"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 mb-1">Size (meters)</label>
-                    <div className="grid grid-cols-2 gap-2">
-                      <input
-                        type="number"
-                        placeholder="Width"
-                        step="10"
-                        min="10"
-                        defaultValue="1000"
-                        onChange={(e) => {
-                          const value = parseFloat(e.target.value);
-                          if (!isNaN(value) && imageBillboard.entity?.billboard && cesiumRef.current) {
-                            imageBillboard.entity.billboard.width = new cesiumRef.current.ConstantProperty(value);
-                          }
-                        }}
-                        className="px-2 py-1 border border-gray-300 rounded text-xs"
-                      />
-                      <input
-                        type="number"
-                        placeholder="Height"
-                        step="10"
-                        min="10"
-                        defaultValue="1000"
-                        onChange={(e) => {
-                          const value = parseFloat(e.target.value);
-                          if (!isNaN(value) && imageBillboard.entity?.billboard && cesiumRef.current) {
-                            imageBillboard.entity.billboard.height = new cesiumRef.current.ConstantProperty(value);
-                          }
-                        }}
-                        className="px-2 py-1 border border-gray-300 rounded text-xs"
-                      />
-                    </div>
-                  </div>
-                )}
-
-                <button
-                  onClick={() => {
-                    const v = viewerRef.current;
-                    if (!v) return;
-                    if (imageBillboard?.type === 'imagery') {
-                      v.imageryLayers.remove(imageBillboard.layer);
-                    } else if (imageBillboard?.type === 'billboard') {
-                      v.entities.remove(imageBillboard.entity);
-                    }
-                    setImageBillboard(null);
-                    if (imageUrlRef.current) {
-                      URL.revokeObjectURL(imageUrlRef.current);
-                      imageUrlRef.current = null;
-                    }
-                  }}
-                  className="w-full px-3 py-2 bg-red-600 text-white rounded-md text-sm hover:bg-red-700"
-                >
-                  Remove Image
-                </button>
+            {/* Resize Controls */}
+            {imageBillboard && (
+              <div className="mt-4 pt-4 border-t">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm font-medium text-gray-700">Image Resizing</label>
+                  <button
+                    onClick={() => setShowResizeHandles(!showResizeHandles)}
+                    className={`px-3 py-1 text-xs rounded-md ${
+                      showResizeHandles 
+                        ? 'bg-blue-600 text-white hover:bg-blue-700' 
+                        : 'bg-gray-300 text-gray-700 hover:bg-gray-400'
+                    }`}
+                  >
+                    {showResizeHandles ? 'Hide Handles' : 'Show Handles'}
+                  </button>
+                </div>
+                <p className="text-xs text-gray-500">
+                  {showResizeHandles 
+                    ? 'Drag yellow corners for uniform scaling, orange edges for non-uniform scaling'
+                    : 'Click "Show Handles" to enable image resizing'
+                  }
+                </p>
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
 
         {/* Map */}
