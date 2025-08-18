@@ -1,5 +1,5 @@
-import CesiumViewer from './components/CesiumViewer';
+import LeafletViewer from './components/LeafletViewer';
 
 export default function Home() {
-  return <CesiumViewer />;
+  return <LeafletViewer />;
 }
