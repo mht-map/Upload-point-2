@@ -18,13 +18,15 @@ export default function LeafletViewerComponent() {
   const imageOverlayRef = useRef<L.ImageOverlay | null>(null);
   const handleMarkersRef = useRef<(L.Marker | null)[]>([]);
   const resizeStartRef = useRef<{ bounds: L.LatLngBounds; marker: L.Marker } | null>(null);
+  const rotateHandleRef = useRef<L.Marker | null>(null);
+  const rotationDegRef = useRef<number>(0);
 
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [transparency, setTransparency] = useState<number>(1.0);
   const [imageAspectRatio, setImageAspectRatio] = useState<number>(1);
   const [showResizeHandles, setShowResizeHandles] = useState<boolean>(false);
   const [showMoveHandle, setShowMoveHandle] = useState<boolean>(false);
-  const [isMoving, setIsMoving] = useState<boolean>(false);
+  const [showRotateHandle, setShowRotateHandle] = useState<boolean>(false);
 
   // Initialize Leaflet map
   useEffect(() => {
@@ -83,6 +85,7 @@ export default function LeafletViewerComponent() {
     // Remove existing handles
     handleMarkersRef.current.filter(marker => marker !== null).forEach(marker => map.removeLayer(marker!));
     handleMarkersRef.current = [];
+    removeRotateHandle();
 
     // Create new image overlay
     const overlay = L.imageOverlay(url, bounds, { 
@@ -91,6 +94,9 @@ export default function LeafletViewerComponent() {
     });
     overlay.addTo(map);
     imageOverlayRef.current = overlay;
+
+    // Apply any existing rotation
+    applyRotation(rotationDegRef.current);
 
     // Fit map to image bounds
     map.fitBounds(bounds, { animate: true, padding: [20, 20] });
@@ -103,6 +109,11 @@ export default function LeafletViewerComponent() {
     // Show move handle if enabled
     if (showMoveHandle) {
       addMoveHandle(bounds);
+    }
+
+    // Show rotate handle if enabled
+    if (showRotateHandle) {
+      addRotateHandle();
     }
   };
 
@@ -123,7 +134,7 @@ export default function LeafletViewerComponent() {
       bounds.getSouthWest(), // SW
     ];
 
-    const cornerHandles = corners.map((latlng) => {
+    const cornerHandles = corners.map((latlng, idx) => {
       const marker = L.marker(latlng, {
         draggable: true,
         icon: L.divIcon({
@@ -148,6 +159,8 @@ export default function LeafletViewerComponent() {
           marker 
         };
         marker.getElement()!.style.cursor = 'grabbing';
+        // Disable map dragging while resizing
+        map.dragging.disable();
       });
 
       marker.on('drag', (e) => {
@@ -158,55 +171,72 @@ export default function LeafletViewerComponent() {
         
         // Calculate new bounds based on which corner was dragged
         let newBounds: L.LatLngBounds;
-        const markerIndex = handleMarkersRef.current.indexOf(currentMarker);
+        const markerIndex = idx; // Use the captured index from closure
         const currentPos = currentMarker.getLatLng();
         
+        // When dragging a corner, only the two edges that meet at that corner should move;
+        // the opposite two edges stay fixed
         switch (markerIndex) {
-          case 0: // NW
+          case 0: // NW: move North and West, keep South and East
             newBounds = L.latLngBounds(
-              [start.getSouth(), start.getWest()],
-              [currentPos.lat, currentPos.lng]
+              [start.getSouth(), currentPos.lng],   // SW
+              [currentPos.lat, start.getEast()]     // NE
             );
             break;
-          case 1: // NE
+          case 1: // NE: move North and East, keep South and West
             newBounds = L.latLngBounds(
-              [start.getSouth(), currentPos.lng],
-              [currentPos.lat, start.getEast()]
+              [start.getSouth(), start.getWest()],  // SW
+              [currentPos.lat, currentPos.lng]      // NE
             );
             break;
-          case 2: // SE
+          case 2: // SE: move South and East, keep North and West
             newBounds = L.latLngBounds(
-              [currentPos.lat, currentPos.lng],
-              [start.getNorth(), start.getEast()]
+              [currentPos.lat, start.getWest()],    // SW
+              [start.getNorth(), currentPos.lng]    // NE
             );
             break;
-          case 3: // SW
+          case 3: // SW: move South and West, keep North and East
             newBounds = L.latLngBounds(
-              [currentPos.lat, start.getWest()],
-              [start.getNorth(), currentPos.lng]
+              [currentPos.lat, currentPos.lng],     // SW
+              [start.getNorth(), start.getEast()]   // NE
             );
             break;
           default:
             return;
         }
 
-        // Maintain aspect ratio for uniform scaling
-        if (markerIndex === 0 || markerIndex === 2) { // Corner handles
-          const currentWidth = newBounds.getEast() - newBounds.getWest();
-          const currentHeight = newBounds.getNorth() - newBounds.getSouth();
-          const currentAspectRatio = currentWidth / currentHeight;
-          
-          // Adjust to maintain original aspect ratio
-          if (Math.abs(currentAspectRatio - imageAspectRatio) > 0.1) {
-            const center = newBounds.getCenter();
-            const halfWidth = Math.max(currentWidth, currentHeight) / 2;
-            const halfHeight = halfWidth / imageAspectRatio;
-            
-            newBounds = L.latLngBounds(
-              [center.lat - halfHeight, center.lng - halfWidth],
-              [center.lat + halfHeight, center.lng + halfWidth]
-            );
+        // Maintain aspect ratio for uniform scaling (all corners)
+        if (markerIndex >= 0 && markerIndex <= 3) {
+          let sw = newBounds.getSouthWest();
+          let ne = newBounds.getNorthEast();
+
+          const width = ne.lng - sw.lng;
+          const height = ne.lat - sw.lat;
+          const ar = imageAspectRatio;
+
+          if (width / height > ar) {
+            // too wide → increase height (move the edge that belongs to the dragged corner)
+            const desiredHeight = width / ar;
+            if (markerIndex === 0 || markerIndex === 1) {
+              // North edge moves
+              ne = L.latLng(sw.lat + desiredHeight, ne.lng);
+            } else {
+              // South edge moves
+              sw = L.latLng(ne.lat - desiredHeight, sw.lng);
+            }
+          } else {
+            // too tall → increase width (move the edge that belongs to the dragged corner)
+            const desiredWidth = height * ar;
+            if (markerIndex === 0 || markerIndex === 3) {
+              // West edge moves
+              sw = L.latLng(sw.lat, ne.lng - desiredWidth);
+            } else {
+              // East edge moves
+              ne = L.latLng(ne.lat, sw.lng + desiredWidth);
+            }
           }
+
+          newBounds = L.latLngBounds(sw, ne);
         }
 
         // Update image overlay bounds
@@ -219,6 +249,8 @@ export default function LeafletViewerComponent() {
       marker.on('dragend', () => {
         resizeStartRef.current = null;
         marker.getElement()!.style.cursor = 'grab';
+        // Re-enable map dragging
+        map.dragging.enable();
       });
 
       return marker;
@@ -257,6 +289,8 @@ export default function LeafletViewerComponent() {
           marker 
         };
         marker.getElement()!.style.cursor = 'grabbing';
+        // Disable map dragging while resizing
+        map.dragging.disable();
       });
 
       marker.on('drag', (e) => {
@@ -307,6 +341,8 @@ export default function LeafletViewerComponent() {
       marker.on('dragend', () => {
         resizeStartRef.current = null;
         marker.getElement()!.style.cursor = 'grab';
+        // Re-enable map dragging
+        map.dragging.enable();
       });
 
       return marker;
@@ -369,13 +405,15 @@ export default function LeafletViewerComponent() {
 
     // Add drag event handlers for move handle
     moveHandle.on('dragstart', (e) => {
-      setIsMoving(true);
       moveHandle.getElement()!.style.cursor = 'grabbing';
       moveHandle.getElement()!.style.transform = 'scale(1.1)';
       
       // Store the starting positions
       dragStartPos = e.target.getLatLng();
       dragStartBounds = imageOverlayRef.current?.getBounds() || null;
+      
+      // Disable map dragging while moving
+      map.dragging.disable();
     });
 
     moveHandle.on('drag', (e) => {
@@ -398,6 +436,9 @@ export default function LeafletViewerComponent() {
       // Update image overlay bounds
       imageOverlayRef.current.setBounds(newBounds);
       
+      // Re-apply current rotation
+      applyRotation(rotationDegRef.current);
+      
       // Update all handle positions
       updateHandlePositions(newBounds);
       
@@ -407,13 +448,15 @@ export default function LeafletViewerComponent() {
     });
 
     moveHandle.on('dragend', () => {
-      setIsMoving(false);
       moveHandle.getElement()!.style.cursor = 'move';
       moveHandle.getElement()!.style.transform = 'scale(1)';
       
       // Clear drag tracking
       dragStartPos = null;
       dragStartBounds = null;
+      
+      // Re-enable map dragging
+      map.dragging.enable();
     });
 
     // Store move handle at index 8 (after resize handles)
@@ -475,7 +518,154 @@ export default function LeafletViewerComponent() {
         handleMarkersRef.current[edgeIndex]!.setLatLng(latlng);
       }
     });
+
+    // Update move handle position (index 8)
+    if (handleMarkersRef.current.length > 8 && handleMarkersRef.current[8]) {
+      handleMarkersRef.current[8]!.setLatLng(newBounds.getCenter());
+    }
+
+    // Update rotation handle position if it exists
+    if (rotateHandleRef.current) {
+      const p = computeRotateHandleLatLng(newBounds);
+      if (p) rotateHandleRef.current.setLatLng(p);
+    }
   };
+
+  // Helper: apply rotation to the image element
+  const applyRotation = useCallback((deg: number) => {
+    const imgEl = imageOverlayRef.current?.getElement() as HTMLImageElement | undefined;
+    if (!imgEl) return;
+    // Force pivot at center
+    imgEl.style.setProperty('transform-origin', '50% 50%', 'important');
+    // Compose rotation with Leaflet's transform without clobbering it
+    const base = imgEl.style.transform || '';
+    const withoutRotate = base.replace(/\s?rotate\([^)]*\)/, '');
+    imgEl.style.transform = `${withoutRotate} rotate(${deg}deg)`.
+      replace(/\s+/g, ' ').trim();
+    imgEl.style.willChange = 'transform';
+  }, []);
+
+  // Compute rotation handle position given current bounds and rotation
+  const computeRotateHandleLatLng = useCallback((bounds: L.LatLngBounds): L.LatLng | null => {
+    const map = mapRef.current;
+    if (!map) return null;
+
+    const center = bounds.getCenter();
+    const topMid = L.latLng(bounds.getNorth(), (bounds.getWest() + bounds.getEast()) / 2);
+    const centerPt = map.latLngToLayerPoint(center);
+    const topPt = map.latLngToLayerPoint(topMid);
+
+    const v = topPt.subtract(centerPt);
+    const len = Math.hypot(v.x, v.y) || 1;
+    const offset = 40; // px above the top edge
+
+    // Rotate the vector by current rotation
+    const theta = (rotationDegRef.current * Math.PI) / 180;
+    const cos = Math.cos(theta);
+    const sin = Math.sin(theta);
+    const rx = v.x * cos - v.y * sin;
+    const ry = v.x * sin + v.y * cos;
+
+    const scale = (len + offset) / len;
+    const handlePt = L.point(centerPt.x + rx * scale, centerPt.y + ry * scale);
+    return map.layerPointToLatLng(handlePt);
+  }, []);
+
+  // Create rotation handle
+  const addRotateHandle = useCallback(() => {
+    const map = mapRef.current;
+    if (!map || !imageOverlayRef.current) return;
+
+    // Remove existing rotate handle
+    if (rotateHandleRef.current) {
+      map.removeLayer(rotateHandleRef.current);
+      rotateHandleRef.current = null;
+    }
+
+    const bounds = imageOverlayRef.current.getBounds();
+    const ll = computeRotateHandleLatLng(bounds);
+    if (!ll) return;
+
+    const handle = L.marker(ll, {
+      draggable: true,
+      icon: L.divIcon({
+        className: 'rotate-handle',
+        html: `<div style="
+          width: 28px; 
+          height: 28px; 
+          background: #10b981; 
+          border: 3px solid white; 
+          border-radius: 50%;
+          cursor: grab;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 14px;
+          font-weight: bold;
+          color: white;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        ">🔄</div>`,
+        iconSize: [28, 28],
+        iconAnchor: [14, 14]
+      })
+    }).addTo(map);
+
+    let dragStartAngleRad = 0;
+    let baseDeg = 0;
+
+    handle.on('dragstart', (e) => {
+      const b = imageOverlayRef.current?.getBounds();
+      if (!b) return;
+      const mapLocal = mapRef.current!;
+      // Calculate starting angle from center to mouse position
+      const center = b.getCenter();
+      const cPt = mapLocal.latLngToLayerPoint(center);
+      const mousePt = mapLocal.latLngToLayerPoint((e.target as L.Marker).getLatLng());
+      dragStartAngleRad = Math.atan2(mousePt.y - cPt.y, mousePt.x - cPt.x);
+      baseDeg = rotationDegRef.current;
+      handle.getElement()!.style.cursor = 'grabbing';
+      mapLocal.dragging.disable();
+    });
+
+    handle.on('drag', (e) => {
+      const b = imageOverlayRef.current?.getBounds();
+      if (!b) return;
+      const mapLocal = mapRef.current!;
+      const center = b.getCenter();
+      const cPt = mapLocal.latLngToLayerPoint(center);
+      const mousePt = mapLocal.latLngToLayerPoint((e.target as L.Marker).getLatLng());
+      const currAngleRad = Math.atan2(mousePt.y - cPt.y, mousePt.x - cPt.x);
+      const deltaDeg = ((currAngleRad - dragStartAngleRad) * 180) / Math.PI;
+      const newDeg = baseDeg + deltaDeg;
+      rotationDegRef.current = newDeg;
+      applyRotation(newDeg);
+      // Reposition handle based on current rotation so it stays outside the top edge
+      const newLL = computeRotateHandleLatLng(b);
+      if (newLL) handle.setLatLng(newLL);
+    });
+
+    handle.on('dragend', () => {
+      const b = imageOverlayRef.current?.getBounds();
+      const mapLocal = mapRef.current!;
+      if (b) {
+        const newLL = computeRotateHandleLatLng(b);
+        if (newLL) handle.setLatLng(newLL);
+      }
+      handle.getElement()!.style.cursor = 'grab';
+      mapLocal.dragging.enable();
+    });
+
+    rotateHandleRef.current = handle;
+  }, [applyRotation, computeRotateHandleLatLng]);
+
+  const removeRotateHandle = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (rotateHandleRef.current) {
+      map.removeLayer(rotateHandleRef.current);
+      rotateHandleRef.current = null;
+    }
+  }, []);
 
   // Function to handle file selection
   const onFileChosen = (f: File | null) => {
@@ -557,6 +747,9 @@ export default function LeafletViewerComponent() {
         imageOverlayRef.current.setBounds(newBounds);
       }
 
+      // Re-apply current rotation
+      applyRotation(rotationDegRef.current);
+
       // Fit map to new bounds
       mapRef.current.fitBounds(newBounds, { animate: true, padding: [20, 20] });
 
@@ -581,8 +774,10 @@ export default function LeafletViewerComponent() {
   useEffect(() => {
     if (imageOverlayRef.current) {
       imageOverlayRef.current.setOpacity(transparency);
+      // keep rotation applied (some browsers may re-rasterize)
+      applyRotation(rotationDegRef.current);
     }
-  }, [transparency]);
+  }, [transparency, applyRotation]);
 
   // Effect to show/hide resize handles
   useEffect(() => {
@@ -613,6 +808,17 @@ export default function LeafletViewerComponent() {
       removeMoveHandle();
     }
   }, [showMoveHandle, addMoveHandle, removeMoveHandle]);
+
+  // Effect to show/hide rotate handle
+  useEffect(() => {
+    if (!imageOverlayRef.current || !mapRef.current) return;
+
+    if (showRotateHandle) {
+      addRotateHandle();
+    } else {
+      removeRotateHandle();
+    }
+  }, [showRotateHandle, addRotateHandle, removeRotateHandle]);
 
   // Keyboard controls for precise movement
   useEffect(() => {
@@ -656,6 +862,9 @@ export default function LeafletViewerComponent() {
 
       // Update image overlay bounds
       imageOverlayRef.current.setBounds(newBounds);
+      
+      // Re-apply current rotation
+      applyRotation(rotationDegRef.current);
       
       // Update all handle positions
       updateHandlePositions(newBounds);
@@ -802,6 +1011,40 @@ export default function LeafletViewerComponent() {
                 )}
               </div>
             )}
+
+            {/* Rotation Controls */}
+            {imageFile && (
+              <div className="mt-4 pt-4 border-t">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm font-medium text-gray-700">Image Rotation</label>
+                  <div className="flex space-x-2">
+                    <button
+                      onClick={() => setShowRotateHandle(!showRotateHandle)}
+                      className={`px-3 py-1 text-xs rounded-md ${
+                        showRotateHandle 
+                          ? 'bg-emerald-600 text-white hover:bg-emerald-700' 
+                          : 'bg-gray-300 text-gray-700 hover:bg-gray-400'
+                      }`}
+                    >
+                      {showRotateHandle ? 'Hide Rotate' : 'Show Rotate'}
+                    </button>
+                    <button
+                      onClick={() => { rotationDegRef.current = 0; applyRotation(0); if (imageOverlayRef.current && rotateHandleRef.current) { const b = imageOverlayRef.current.getBounds(); const p = computeRotateHandleLatLng(b); if (p) rotateHandleRef.current.setLatLng(p); } }}
+                      className="px-3 py-1 text-xs rounded-md bg-red-500 text-white hover:bg-red-600"
+                      title="Reset rotation to 0°"
+                    >
+                      Reset
+                    </button>
+                  </div>
+                </div>
+                <p className="text-xs text-gray-500">
+                  {showRotateHandle 
+                    ? '🟢 Drag the green handle to rotate the image around its center'
+                    : 'Click "Show Rotate" to enable image rotation'
+                  }
+                </p>
+              </div>
+            )}
           </div>
         </div>
 
@@ -822,12 +1065,12 @@ export default function LeafletViewerComponent() {
 
           {/* Transparency Control Panel - Always visible when image is uploaded */}
           {imageFile && (
-            <div className="absolute top-4 right-4 bg-white bg-opacity-95 backdrop-blur-sm rounded-lg shadow-lg p-4 border border-gray-200 min-w-[200px] z-50 transparency-panel">
-              <h3 className="text-sm font-semibold text-gray-700 mb-3">Image Transparency</h3>
+            <div className="absolute top-4 right-4 bg-white bg-opacity-95 backdrop-blur-sm rounded-lg shadow-lg p-4 border-2 border-blue-300 min-w-[200px] z-[9999] transparency-panel">
+              <h3 className="text-sm font-semibold text-blue-700 mb-3">Image Transparency</h3>
                
               <div className="space-y-3">
                 <div className="relative">
-                  <label className="block text-xs text-gray-600 mb-1">
+                  <label className="block text-xs text-blue-600 mb-1">
                     Opacity: {Math.round(transparency * 100)}%
                   </label>
                   {/* Visual track line */}
@@ -839,8 +1082,12 @@ export default function LeafletViewerComponent() {
                     step="0.01"
                     value={transparency}
                     onChange={(e) => setTransparency(parseFloat(e.target.value))}
-                    className="relative w-full h-2 rounded-lg appearance-none cursor-pointer slider z-10"
-                    style={{ marginTop: '0px' }}
+                    className="relative w-full h-2 rounded-lg appearance-none cursor-pointer slider"
+                    style={{ 
+                      marginTop: '0px',
+                      position: 'relative',
+                      zIndex: 1001
+                    }}
                   />
                 </div>
               </div>
