@@ -28,7 +28,55 @@ export default function LeafletViewerComponent() {
   const [imageAspectRatio, setImageAspectRatio] = useState<number>(1);
   const [showResizeHandles, setShowResizeHandles] = useState<boolean>(false);
   const [showRotateHandle, setShowRotateHandle] = useState<boolean>(false);
+  const [rotationDeg, setRotationDeg] = useState<number>(0);
   const [mapStyle, setMapStyle] = useState<'road' | 'aerial'>('aerial');
+  const [savedImages, setSavedImages] = useState<Array<{
+    id: string;
+    name: string;
+    url: string;
+    bounds: L.LatLngBounds;
+    rotation: number;
+    transparency: number;
+    timestamp: number;
+  }>>([]);
+  const [activeImageId, setActiveImageId] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [isImageLoaded, setIsImageLoaded] = useState(false);
+  const [currentImageUrl, setCurrentImageUrl] = useState<string | null>(null);
+  const [isInitialLoadComplete, setIsInitialLoadComplete] = useState(false);
+
+  // Function to load all saved images as overlays (for display purposes)
+  const loadAllSavedImagesAsOverlays = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    
+    // Get current values from refs to avoid dependency issues
+    const currentSavedImages = savedImages;
+    const currentActiveId = activeImageId;
+    
+    if (currentSavedImages.length === 0) return;
+
+    // Load all saved images as non-interactive overlays (except the active one)
+    currentSavedImages.forEach((savedImage) => {
+      // Skip if this is the currently active image
+      if (currentActiveId === savedImage.id) return;
+      
+      const overlay = L.imageOverlay(savedImage.url, savedImage.bounds, {
+        opacity: savedImage.transparency,
+        interactive: false // These are just for display, not for editing
+      });
+      overlay.addTo(map);
+      
+      // Apply rotation
+      if (savedImage.rotation !== 0) {
+        const imgElement = overlay.getElement();
+        if (imgElement) {
+          imgElement.style.transform = `rotate(${savedImage.rotation}deg)`;
+          imgElement.style.transformOrigin = 'center';
+        }
+      }
+    });
+  }, []);
 
   // Initialize Leaflet map
   useEffect(() => {
@@ -47,8 +95,8 @@ export default function LeafletViewerComponent() {
     });
 
     const aerialLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-      maxZoom: 19,
-      attribution: '&copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+        maxZoom: 19,
+        attribution: '&copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
     });
 
     // Store layer references
@@ -96,13 +144,15 @@ export default function LeafletViewerComponent() {
     handleMarkersRef.current = [];
     removeRotateHandle();
 
-    // Create new image overlay
+    // Create new image overlay and add it immediately
     const overlay = L.imageOverlay(url, bounds, { 
       opacity: transparency,
-      interactive: true // Make it clickable for handles
+      interactive: true
     });
+    
     overlay.addTo(map);
     imageOverlayRef.current = overlay;
+    setIsImageLoaded(true);
 
     // Apply any existing rotation
     applyRotation(rotationDegRef.current);
@@ -113,11 +163,10 @@ export default function LeafletViewerComponent() {
     // Show resize handles if enabled
     if (showResizeHandles) {
       addResizeHandles(bounds);
-      // Update handle positions to account for rotation
       updateHandlePositions(bounds);
     }
 
-    // Add Ctrl+click and drag functionality to the image overlay
+    // Add Ctrl+click and drag functionality
     addImageOverlayDragHandlers(overlay);
 
     // Show rotate handle if enabled
@@ -130,6 +179,8 @@ export default function LeafletViewerComponent() {
   const computeRotatedImageCorners = (bounds: L.LatLngBounds, rotationDeg: number) => {
     const map = mapRef.current;
     if (!map) return { corners: [], edges: [] };
+
+    console.log(`computeRotatedImageCorners called with rotation: ${rotationDeg} degrees`);
 
     const center = bounds.getCenter();
     const centerPt = map.latLngToLayerPoint(center);
@@ -155,6 +206,8 @@ export default function LeafletViewerComponent() {
     const cos = Math.cos(rad);
     const sin = Math.sin(rad);
 
+    console.log(`Rotation math: rad=${rad}, cos=${cos}, sin=${sin}`);
+
     // Rotate corners around center
     const rotatedCorners = corners.map(corner => {
       const dx = corner.x - centerPt.x;
@@ -173,6 +226,7 @@ export default function LeafletViewerComponent() {
       return map.layerPointToLatLng(L.point(rotatedX, rotatedY));
     });
 
+    console.log(`Returning ${rotatedCorners.length} corners and ${rotatedEdges.length} edges`);
     return { corners: rotatedCorners, edges: rotatedEdges };
   };
 
@@ -587,8 +641,11 @@ export default function LeafletViewerComponent() {
   const updateHandlePositions = (newBounds: L.LatLngBounds) => {
     if (handleMarkersRef.current.length === 0) return;
 
+    const currentRotation = rotationDegRef.current;
+    console.log(`updateHandlePositions called with rotation: ${currentRotation} degrees`);
+
     // Calculate rotated positions for handles
-    const { corners, edges } = computeRotatedImageCorners(newBounds, rotationDegRef.current);
+    const { corners, edges } = computeRotatedImageCorners(newBounds, currentRotation);
 
     // Update corner handle positions
     corners.forEach((latlng, i) => {
@@ -872,14 +929,19 @@ export default function LeafletViewerComponent() {
   }, []);
 
   // Function to handle file selection
-  const onFileChosen = (f: File | null) => {
+  const onFileChosen = async (f: File | null) => {
     setImageFile(f);
+    
     if (!f) {
+      // Clear image and reset states
       if (imageOverlayRef.current && mapRef.current) {
         mapRef.current.removeLayer(imageOverlayRef.current);
         imageOverlayRef.current = null;
       }
       setImageAspectRatio(1);
+      setActiveImageId(null);
+      setIsImageLoaded(false);
+      setCurrentImageUrl(null);
       return;
     }
 
@@ -890,15 +952,48 @@ export default function LeafletViewerComponent() {
       return;
     }
 
-    // Calculate aspect ratio
+    if (f.size > 10 * 1024 * 1024) {
+      alert('File too large. Please select an image under 10MB.');
+      setImageFile(null);
+      setImageAspectRatio(1);
+      return;
+    }
+
+    try {
+      setIsUploading(true);
+      
+      // Upload file to server
+      const formData = new FormData();
+      formData.append('file', f);
+      
+      const response = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Upload failed');
+      }
+      
+      const uploadResult = await response.json();
+      
+      // Create image element to get dimensions
     const img = new Image();
     img.onload = () => {
       const aspectRatio = img.width / img.height;
       setImageAspectRatio(aspectRatio);
-      console.log('Image dimensions:', img.width, 'x', img.height, 'Aspect ratio:', aspectRatio);
+
+        // Clear any existing saved image overlays when uploading new image
+        if (mapRef.current) {
+          mapRef.current.eachLayer((layer) => {
+            if (layer instanceof L.ImageOverlay && layer !== imageOverlayRef.current) {
+              mapRef.current!.removeLayer(layer);
+            }
+          });
+        }
 
       // Create initial bounds
-      const url = URL.createObjectURL(f);
       const baseWidth = 0.01; // Base width in degrees
       const baseHeight = baseWidth / aspectRatio;
       
@@ -907,9 +1002,23 @@ export default function LeafletViewerComponent() {
         [baseHeight / 2, baseWidth / 2]
       );
 
-      showImage(url, bounds);
-    };
-    img.src = URL.createObjectURL(f);
+        // Store the server URL for saving later
+        setCurrentImageUrl(uploadResult.url);
+        
+        // Use the server URL instead of object URL
+        showImage(uploadResult.url, bounds);
+      };
+      img.src = uploadResult.url;
+      
+    } catch (error) {
+      console.error('Upload error:', error);
+      alert(`Upload failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      setImageFile(null);
+      setImageAspectRatio(1);
+      setIsImageLoaded(false);
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   // Function to switch map style
@@ -951,7 +1060,7 @@ export default function LeafletViewerComponent() {
 
   // Function to center image at postcode
   const centerImageAtPostcode = async (postcode: string) => {
-    if (!imageOverlayRef.current || !mapRef.current) {
+    if (!imageFile || !mapRef.current) {
       alert('Please upload an image first to use postcode centering.');
       return;
     }
@@ -1108,10 +1217,269 @@ export default function LeafletViewerComponent() {
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [updateHandlePositions]);
 
+  // Function to save current image
+  const saveCurrentImage = useCallback(() => {
+    if (!imageFile || !imageOverlayRef.current || !currentImageUrl) {
+      alert('No image to save. Please upload an image first.');
+      return;
+    }
+    
+    const bounds = imageOverlayRef.current.getBounds();
+    
+    console.log('Saving image:', {
+      imageFile: imageFile?.name,
+      currentUrl: currentImageUrl,
+      bounds: bounds,
+      imageOverlayRef: imageOverlayRef.current
+    });
+    
+    // Check if this is an update to an existing saved image
+    const existingImageIndex = savedImages.findIndex(img => img.url === currentImageUrl);
+    
+    if (existingImageIndex !== -1) {
+      // Update existing saved image
+      const updatedImage = {
+        ...savedImages[existingImageIndex],
+        bounds: bounds,
+        rotation: rotationDegRef.current,
+        transparency: transparency,
+        timestamp: Date.now()
+      };
+      
+      setSavedImages(prev => {
+        const newSavedImages = [...prev];
+        newSavedImages[existingImageIndex] = updatedImage;
+        console.log('Updated existing saved image:', updatedImage);
+        return newSavedImages;
+      });
+      
+      setActiveImageId(updatedImage.id);
+      alert(`Image "${imageFile.name}" updated successfully!`);
+    } else {
+      // Create new saved image
+      const newSavedImage = {
+        id: `img_${Date.now()}`,
+        name: imageFile.name,
+        url: currentImageUrl,
+        bounds: bounds,
+        rotation: rotationDegRef.current,
+        transparency: transparency,
+        timestamp: Date.now()
+      };
+      
+      setSavedImages(prev => {
+        const newSavedImages = [...prev, newSavedImage];
+        console.log('Created new saved image:', newSavedImage);
+        return newSavedImages;
+      });
+      
+      setActiveImageId(newSavedImage.id);
+      alert(`Image "${imageFile.name}" saved successfully!`);
+    }
+  }, [imageFile, transparency, currentImageUrl, savedImages]);
+
+  // Function to load saved image - using same logic as showImage
+  const loadSavedImage = useCallback((savedImage: typeof savedImages[0]) => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    // Remove current image if any
+    if (imageOverlayRef.current) {
+      map.removeLayer(imageOverlayRef.current);
+    }
+
+    // Clear all display overlays (non-active saved images)
+    map.eachLayer((layer) => {
+      if (layer instanceof L.ImageOverlay && layer !== imageOverlayRef.current) {
+        map.removeLayer(layer);
+      }
+    });
+
+    // Set up the loaded image for editing - same as fresh upload
+    setImageFile(new File([], savedImage.name));
+    setCurrentImageUrl(savedImage.url);
+    setIsImageLoaded(true);
+    setTransparency(savedImage.transparency);
+    rotationDegRef.current = savedImage.rotation;
+    setRotationDeg(savedImage.rotation);
+
+    // Use the exact same logic as showImage function
+    const overlay = L.imageOverlay(savedImage.url, savedImage.bounds, { 
+      opacity: savedImage.transparency,
+      interactive: true
+    });
+    
+    overlay.addTo(map);
+    imageOverlayRef.current = overlay;
+
+    // Apply any existing rotation immediately
+    applyRotation(savedImage.rotation);
+
+    // Fit map to image bounds
+    map.fitBounds(savedImage.bounds, { animate: true, padding: [20, 20] });
+
+    // Show resize handles if enabled
+    setShowResizeHandles(true);
+    addResizeHandles(savedImage.bounds);
+    updateHandlePositions(savedImage.bounds);
+
+    // Add Ctrl+click and drag functionality
+    addImageOverlayDragHandlers(overlay);
+
+    // Show rotate handle if enabled
+    setShowRotateHandle(true);
+    addRotateHandle();
+
+    setActiveImageId(savedImage.id);
+
+    console.log(`Loaded saved image: ${savedImage.name} - Ready for editing!`);
+
+  }, [applyRotation, addResizeHandles, updateHandlePositions, addImageOverlayDragHandlers, addRotateHandle]);
+
+  // Function to delete saved image
+  const deleteSavedImage = useCallback(async (imageId: string) => {
+    const imageToDelete = savedImages.find(img => img.id === imageId);
+    
+    if (imageToDelete) {
+      try {
+        // Extract filename from URL (e.g., /uploads/abc123.jpg -> abc123.jpg)
+        const filename = imageToDelete.url.split('/').pop();
+        if (filename) {
+          // Delete file from server
+          const response = await fetch('/api/delete', {
+            method: 'DELETE',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ filename }),
+          });
+          
+          if (!response.ok) {
+            console.warn('Failed to delete file from server:', filename);
+          }
+        }
+      } catch (error) {
+        console.error('Error deleting file from server:', error);
+      }
+    }
+    
+    setSavedImages(prev => prev.filter(img => img.id !== imageId));
+    
+    if (activeImageId === imageId) {
+      setActiveImageId(null);
+      // Clear current image if it was the active one
+      if (imageOverlayRef.current) {
+        const map = mapRef.current;
+        if (map) {
+          map.removeLayer(imageOverlayRef.current);
+        }
+        imageOverlayRef.current = null;
+      }
+      setImageFile(null);
+    }
+  }, [activeImageId, savedImages]);
+
+  // Function to refresh all saved image overlays
+  const refreshSavedImageOverlays = useCallback(() => {
+    if (!mapRef.current) return;
+    
+    // Clear any existing display overlays (not the active one)
+    const map = mapRef.current;
+    map.eachLayer((layer) => {
+      if (layer instanceof L.ImageOverlay && layer !== imageOverlayRef.current) {
+        map.removeLayer(layer);
+      }
+    });
+    
+    // Reload all saved images as overlays
+    loadAllSavedImagesAsOverlays();
+  }, []);
+
+  // Load saved images from localStorage on component mount
+  useEffect(() => {
+    console.log('Loading saved images from localStorage...');
+    const saved = localStorage.getItem('savedImages');
+    console.log('localStorage savedImages:', saved);
+    
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        console.log('Parsed saved images:', parsed);
+        
+        // Convert serialized bounds back to L.LatLngBounds objects
+        const restoredImages = parsed.map((img: any) => ({
+          ...img,
+          bounds: L.latLngBounds(
+            [img.bounds._southWest.lat, img.bounds._southWest.lng],
+            [img.bounds._northEast.lat, img.bounds._northEast.lng]
+          )
+        }));
+        console.log('Restored images with bounds:', restoredImages);
+        
+        setSavedImages(restoredImages);
+        
+        // Wait for map to be ready, then display all saved images as overlays
+        if (restoredImages.length > 0) {
+          const checkMapReady = () => {
+            if (mapRef.current && mapRef.current.getSize().x > 0) {
+              console.log('Map ready, loading saved image overlays...');
+              // Display all saved images as non-interactive overlays
+              setTimeout(() => {
+                loadAllSavedImagesAsOverlays();
+              }, 500);
+            } else {
+              setTimeout(checkMapReady, 100);
+            }
+          };
+          checkMapReady();
+        }
+        
+        // Mark initial load as complete
+        setIsInitialLoadComplete(true);
+      } catch (e) {
+        console.error('Failed to parse saved images:', e);
+        setIsInitialLoadComplete(true);
+      }
+    } else {
+      console.log('No saved images found in localStorage');
+      setIsInitialLoadComplete(true);
+    }
+  }, []);
+
+  // Save to localStorage whenever savedImages changes
+  useEffect(() => {
+    // Don't save to localStorage until initial load is complete
+    if (!isInitialLoadComplete) {
+      console.log('Skipping localStorage save - initial load not complete yet');
+      return;
+    }
+    
+    console.log('Saving to localStorage, savedImages:', savedImages);
+    
+    // Convert L.LatLngBounds objects to serializable format
+    const serializableImages = savedImages.map(img => ({
+      ...img,
+      bounds: {
+        _southWest: { lat: img.bounds.getSouthWest().lat, lng: img.bounds.getSouthWest().lng },
+        _northEast: { lat: img.bounds.getNorthEast().lat, lng: img.bounds.getNorthEast().lng }
+      }
+    }));
+    
+    const jsonString = JSON.stringify(serializableImages);
+    console.log('Saving to localStorage:', jsonString);
+    localStorage.setItem('savedImages', jsonString);
+    
+    // Verify it was saved
+    const saved = localStorage.getItem('savedImages');
+    console.log('Verified localStorage save:', saved);
+  }, [savedImages, isInitialLoadComplete]);
+
+
+
   return (
     <div suppressHydrationWarning={true}>
       <div className="w-full h-screen grid grid-cols-12 grid-rows-1">
-        {/* Sidebar */}
+        {/* Left Sidebar */}
         <div className="col-span-4 xl:col-span-3 bg-white p-4 border-r border-gray-200 overflow-y-auto">
           <div className="flex items-center gap-3 mb-4">
             <img 
@@ -1136,7 +1504,9 @@ export default function LeafletViewerComponent() {
               className="block w-full"
             />
             {imageFile && (
-              <p className="text-xs text-gray-500 mt-1">Loaded: {imageFile.name}</p>
+              <div className="mt-2 p-2 rounded border text-xs text-green-600 border-green-200 bg-green-50">
+                ✅ {imageFile.name} uploaded
+              </div>
             )}
           </div>
 
@@ -1149,9 +1519,14 @@ export default function LeafletViewerComponent() {
               <input
                 type="text"
                 placeholder="Enter UK postcode (e.g., SW1A 1AA)"
-                className="flex-1 px-3 py-2 border border-gray-300 rounded-md text-sm"
+                className={`flex-1 px-3 py-2 border rounded-md text-sm ${
+                  !imageFile
+                    ? 'border-gray-200 bg-gray-100 text-gray-400 cursor-not-allowed'
+                    : 'border-gray-300 bg-white text-gray-900'
+                }`}
+                disabled={!imageFile}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
+                  if (e.key === 'Enter' && imageFile) {
                     const postcode = (e.currentTarget as HTMLInputElement).value.trim();
                     if (postcode) centerImageAtPostcode(postcode);
                   }
@@ -1159,22 +1534,32 @@ export default function LeafletViewerComponent() {
               />
               <button
                 onClick={() => {
+                  if (!imageFile) return;
                   const postcodeInput = document.querySelector('input[placeholder*="postcode"]') as HTMLInputElement;
                   const postcode = postcodeInput?.value.trim();
                   if (postcode) centerImageAtPostcode(postcode);
                 }}
-                className="px-4 py-2 bg-blue-600 text-white rounded-md text-sm hover:bg-blue-700"
+                disabled={!imageFile}
+                className={`px-4 py-2 text-sm rounded-md transition-colors ${
+                  !imageFile
+                    ? 'bg-gray-400 text-gray-200 cursor-not-allowed'
+                    : 'bg-blue-600 text-white hover:bg-blue-700'
+                }`}
               >
                 Center
               </button>
             </div>
 
             <p className="text-xs text-gray-500 mt-1">
-              Enter a UK postcode and press Enter or click Center to position the image
+              {!imageFile 
+                ? 'Upload an image first to enable postcode centering'
+                : 'Enter a UK postcode and press Enter or click Center to position the image'
+              }
             </p>
             <div className="mt-2 text-xs text-gray-400">
               <p className="font-medium">Example postcodes:</p>
-              <p>SW1A 1AA (Buckingham Palace), M1 1AA (Manchester), B1 1AA (Birmingham)</p>
+              <p>SW1A 1AA (Buckingham Palace)</p>
+              <p>M1 1AA (Manchester), B1 1AA (Birmingham)</p>
             </div>
 
             {/* Resize Controls */}
@@ -1195,9 +1580,12 @@ export default function LeafletViewerComponent() {
                 </div>
                 <p className="text-xs text-gray-500">
                   {showResizeHandles 
-                    ? '🟡 Drag yellow corners for uniform scaling, 🟠 Drag orange edges for non-uniform scaling'
+                    ? '🟡 Drag yellow corners for uniform scaling'
                     : 'Click "Show Handles" to enable image resizing'
                   }
+                  {showResizeHandles && (
+                    <span className="block mt-1">🟠 Drag orange edges for non-uniform scaling</span>
+                  )}
                 </p>
                 {showResizeHandles && (
                   <div className="mt-2 p-2 bg-blue-50 rounded border border-blue-200">
@@ -1219,16 +1607,16 @@ export default function LeafletViewerComponent() {
                 <p className="text-xs text-gray-500">
                   Hold Ctrl and drag anywhere on the image to move it
                 </p>
-                <div className="mt-2 p-2 bg-green-50 rounded border border-green-200">
-                  <p className="text-xs text-green-700">
+                  <div className="mt-2 p-2 bg-green-50 rounded border border-green-200">
+                    <p className="text-xs text-green-700">
                     <strong>Tip:</strong> Hold the Ctrl key and drag anywhere on the image to smoothly move it around the map.
-                  </p>
-                  <div className="mt-2 pt-2 border-t border-green-200">
-                    <p className="text-xs text-green-600 font-medium">Precision Controls:</p>
+                    </p>
+                    <div className="mt-2 pt-2 border-t border-green-200">
+                      <p className="text-xs text-green-600 font-medium">Precision Controls:</p>
                     <p className="text-xs text-green-600">• Ctrl + Drag: Fine-tuned movement from anywhere on image</p>
-                    <p className="text-xs text-green-600">• Arrow keys: Pixel-perfect positioning</p>
+                      <p className="text-xs text-green-600">• Arrow keys: Pixel-perfect positioning</p>
+                    </div>
                   </div>
-                </div>
               </div>
             )}
 
@@ -1265,11 +1653,40 @@ export default function LeafletViewerComponent() {
                 </p>
               </div>
             )}
+
+            {/* Save Image Button */}
+            {imageFile && (
+              <div className="mt-4 pt-4 border-t">
+                <button
+                  onClick={saveCurrentImage}
+                  className="w-full px-4 py-2 text-sm transition-colors bg-green-600 text-white hover:bg-green-700"
+                >
+                  {activeImageId ? '💾 Update Saved Image' : '💾 Save Image Position'}
+                </button>
+                
+                <p className="text-xs text-gray-500 mt-2">
+                  Save the current image position, rotation, and transparency for later use
+                </p>
+              </div>
+            )}
+
+            {/* Instructions */}
+            <div className="mt-6 pt-4 border-t">
+              <h4 className="text-sm font-medium text-gray-700 mb-2">How to Use</h4>
+              <div className="text-xs text-gray-600 space-y-2">
+                <p>1. <strong>Upload:</strong> Select an image file</p>
+                <p>2. <strong>Position:</strong> Use Ctrl+drag to move the image</p>
+                <p>3. <strong>Resize:</strong> Show handles and drag corners/edges</p>
+                <p>4. <strong>Rotate:</strong> Show rotate handle and drag to rotate</p>
+                <p>5. <strong>Save:</strong> Click "Save Image Position" to store</p>
+                <p>6. <strong>Load:</strong> Click saved images in right sidebar</p>
+              </div>
+            </div>
           </div>
         </div>
 
         {/* Map */}
-        <div className="col-span-8 xl:col-span-9 relative">
+        <div className="col-span-6 xl:col-span-7 relative">
           <div ref={containerRef} className="w-full h-full" />
 
           {/* Map Style Toggle - Top Left */}
@@ -1299,8 +1716,8 @@ export default function LeafletViewerComponent() {
 
           {!imageFile && (
             <div className="absolute inset-0 flex items-center justify-center bg-gray-100">
-                          <div className="text-center">
-              <div className="text-6xl mb-4">🗺️</div>
+              <div className="text-center">
+                <div className="text-6xl mb-4">🗺️</div>
               <div className="flex items-center justify-center gap-3 mb-2">
                 <img 
                   src="/1st_planner_ltd_logo.jfif" 
@@ -1309,11 +1726,11 @@ export default function LeafletViewerComponent() {
                 />
                 <h2 className="text-xl font-semibold text-blue-700 mb-2">Image Overlay Tool</h2>
               </div>
-              <p className="text-gray-500">Upload an image to overlay it on the map</p>
+                <p className="text-gray-500">Upload an image to overlay it on the map</p>
               <p className="text-sm text-gray-400 mt-2">
                 Powered by Leaflet & {mapStyle === 'road' ? 'OpenStreetMap' : 'ESRI World Imagery'}
               </p>
-            </div>
+              </div>
             </div>
           )}
 
@@ -1345,6 +1762,83 @@ export default function LeafletViewerComponent() {
                   />
                 </div>
               </div>
+            </div>
+          )}
+        </div>
+
+        {/* Right Sidebar - Saved Images */}
+        <div className="col-span-2 xl:col-span-2 bg-white p-4 border-l border-gray-200 overflow-y-auto">
+          <div className="mb-4">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-lg font-semibold text-gray-800">Saved Images</h3>
+              <button
+                onClick={refreshSavedImageOverlays}
+                className="px-2 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                title="Refresh saved image overlays"
+              >
+                🔄
+              </button>
+            </div>
+            <p className="text-xs text-gray-600">Click any saved image to load it on the map</p>
+          </div>
+
+          {savedImages.length === 0 ? (
+            <div className="text-center py-8">
+              <div className="text-4xl mb-2">📁</div>
+              <p className="text-gray-500 text-sm">No saved images yet</p>
+              <p className="text-gray-400 text-xs mt-1">Upload and save an image to see it here</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {savedImages.map((savedImage) => (
+                <div
+                  key={savedImage.id}
+                  className={`p-3 rounded-lg border-2 cursor-pointer transition-all hover:shadow-md ${
+                    activeImageId === savedImage.id
+                      ? 'border-blue-500 bg-blue-50'
+                      : 'border-gray-200 bg-gray-50 hover:border-gray-300'
+                  }`}
+                  onClick={() => loadSavedImage(savedImage)}
+                >
+                  <div className="flex items-start justify-between mb-2">
+                    <div className="flex-1 min-w-0">
+                      <h4 className="font-medium text-gray-800 text-sm truncate" title={savedImage.name}>
+                        {savedImage.name}
+                      </h4>
+                      <p className="text-xs text-gray-500">
+                        {new Date(savedImage.timestamp).toLocaleDateString()}
+                      </p>
+                    </div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteSavedImage(savedImage.id);
+                      }}
+                      className="ml-2 p-1 text-red-500 hover:text-red-700 hover:bg-red-100 rounded transition-colors"
+                      title="Delete saved image"
+                    >
+                      🗑️
+                    </button>
+                  </div>
+                  
+                  <div className="text-xs text-gray-600 space-y-1">
+                    <div className="flex justify-between">
+                      <span>Rotation:</span>
+                      <span className="font-medium">{Math.round(savedImage.rotation)}°</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Opacity:</span>
+                      <span className="font-medium">{Math.round(savedImage.transparency * 100)}%</span>
+                    </div>
+                  </div>
+
+                  {activeImageId === savedImage.id && (
+                    <div className="mt-2 pt-2 border-t border-blue-200">
+                      <span className="text-xs text-blue-600 font-medium">✓ Currently Active</span>
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           )}
         </div>
