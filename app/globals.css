@@ -79,6 +79,24 @@ body {
   -webkit-tap-highlight-color: transparent !important;
 }
 
+/* Image overlay cursor styles */
+.leaflet-image-overlay {
+  cursor: default;
+}
+
+.leaflet-image-overlay:hover {
+  cursor: move;
+}
+
+/* When Ctrl is pressed, show move cursor */
+.leaflet-image-overlay.ctrl-pressed {
+  cursor: grab !important;
+}
+
+.leaflet-image-overlay.ctrl-pressed:hover {
+  cursor: grab !important;
+}
+
 .slider::-webkit-slider-track {
   background: #1e40af !important;
   height: 16px !important;

@@ -20,13 +20,15 @@ export default function LeafletViewerComponent() {
   const resizeStartRef = useRef<{ bounds: L.LatLngBounds; marker: L.Marker } | null>(null);
   const rotateHandleRef = useRef<L.Marker | null>(null);
   const rotationDegRef = useRef<number>(0);
+  const roadLayerRef = useRef<L.TileLayer | null>(null);
+  const aerialLayerRef = useRef<L.TileLayer | null>(null);
 
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [transparency, setTransparency] = useState<number>(1.0);
   const [imageAspectRatio, setImageAspectRatio] = useState<number>(1);
   const [showResizeHandles, setShowResizeHandles] = useState<boolean>(false);
-  const [showMoveHandle, setShowMoveHandle] = useState<boolean>(false);
   const [showRotateHandle, setShowRotateHandle] = useState<boolean>(false);
+  const [mapStyle, setMapStyle] = useState<'road' | 'aerial'>('aerial');
 
   // Initialize Leaflet map
   useEffect(() => {
@@ -38,25 +40,32 @@ export default function LeafletViewerComponent() {
       preferCanvas: false
     }).setView([51.5074, -0.1278], 13); // London default
 
-    // Start with OSM tiles to test, then switch to ESRI aerial
-    const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    // Create both map layers
+    const roadLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
       attribution: '&copy; OpenStreetMap contributors'
-    }).addTo(map);
+    });
 
-    // Switch to ESRI aerial after a short delay to ensure OSM loads first
-    setTimeout(() => {
-      if (map && !map.hasLayer(osmLayer)) return; // Map was destroyed
-      
-      // Remove OSM layer
-      map.removeLayer(osmLayer);
-      
-      // Add ESRI World Imagery basemap (aerial/satellite view)
-      L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-        maxZoom: 19,
-        attribution: '&copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
-      }).addTo(map);
-    }, 2000); // Switch after 2 seconds
+    const aerialLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19,
+      attribution: '&copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+    });
+
+    // Store layer references
+    roadLayerRef.current = roadLayer;
+    aerialLayerRef.current = aerialLayer;
+
+    // Start with aerial layer (default)
+    aerialLayer.addTo(map);
+    
+    // Ensure both layers are ready
+    roadLayer.on('load', () => {
+      console.log('Road layer loaded');
+    });
+    
+    aerialLayer.on('load', () => {
+      console.log('Aerial layer loaded');
+    });
 
     // Ensure correct sizing after mount/resizes
     const onReady = () => map.invalidateSize();
@@ -104,18 +113,108 @@ export default function LeafletViewerComponent() {
     // Show resize handles if enabled
     if (showResizeHandles) {
       addResizeHandles(bounds);
+      // Update handle positions to account for rotation
+      updateHandlePositions(bounds);
     }
 
-    // Show move handle if enabled
-    if (showMoveHandle) {
-      addMoveHandle(bounds);
-    }
+    // Add Ctrl+click and drag functionality to the image overlay
+    addImageOverlayDragHandlers(overlay);
 
     // Show rotate handle if enabled
     if (showRotateHandle) {
       addRotateHandle();
     }
   };
+
+  // Function to calculate visual corners of rotated image
+  const computeRotatedImageCorners = (bounds: L.LatLngBounds, rotationDeg: number) => {
+    const map = mapRef.current;
+    if (!map) return { corners: [], edges: [] };
+
+    const center = bounds.getCenter();
+    const centerPt = map.latLngToLayerPoint(center);
+    
+    // Calculate the four corners in layer coordinates
+    const corners = [
+      map.latLngToLayerPoint(bounds.getNorthWest()), // NW
+      map.latLngToLayerPoint(bounds.getNorthEast()), // NE
+      map.latLngToLayerPoint(bounds.getSouthEast()), // SE
+      map.latLngToLayerPoint(bounds.getSouthWest()), // SW
+    ];
+
+    // Calculate edge midpoints in layer coordinates
+    const edges = [
+      map.latLngToLayerPoint(L.latLng(bounds.getNorth(), (bounds.getWest() + bounds.getEast()) / 2)), // North
+      map.latLngToLayerPoint(L.latLng((bounds.getSouth() + bounds.getNorth()) / 2, bounds.getEast())), // East
+      map.latLngToLayerPoint(L.latLng(bounds.getSouth(), (bounds.getWest() + bounds.getEast()) / 2)), // South
+      map.latLngToLayerPoint(L.latLng((bounds.getSouth() + bounds.getNorth()) / 2, bounds.getWest())), // West
+    ];
+
+    // Apply rotation transformation
+    const rad = (rotationDeg * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+
+    // Rotate corners around center
+    const rotatedCorners = corners.map(corner => {
+      const dx = corner.x - centerPt.x;
+      const dy = corner.y - centerPt.y;
+      const rotatedX = centerPt.x + dx * cos - dy * sin;
+      const rotatedY = centerPt.y + dx * sin + dy * cos;
+      return map.layerPointToLatLng(L.point(rotatedX, rotatedY));
+    });
+
+    // Rotate edges around center
+    const rotatedEdges = edges.map(edge => {
+      const dx = edge.x - centerPt.x;
+      const dy = edge.y - centerPt.y;
+      const rotatedX = centerPt.x + dx * cos - dy * sin;
+      const rotatedY = centerPt.y + dx * sin + dy * cos;
+      return map.layerPointToLatLng(L.point(rotatedX, rotatedY));
+    });
+
+    return { corners: rotatedCorners, edges: rotatedEdges };
+  };
+
+  // Function to convert visual handle positions back to geographic bounds
+  const computeBoundsFromVisualHandles = (handlePositions: L.LatLng[], rotationDeg: number) => {
+    const map = mapRef.current;
+    if (!map || handlePositions.length < 4) return null;
+
+    const center = L.latLng(
+      (handlePositions[0].lat + handlePositions[1].lat + handlePositions[2].lat + handlePositions[3].lat) / 4,
+      (handlePositions[0].lng + handlePositions[1].lng + handlePositions[2].lng + handlePositions[3].lng) / 4
+    );
+    const centerPt = map.latLngToLayerPoint(center);
+
+    // Convert handle positions to layer coordinates
+    const handlePts = handlePositions.map(pos => map.latLngToLayerPoint(pos));
+
+    // Apply inverse rotation transformation
+    const rad = (-rotationDeg * Math.PI) / 180; // Negative rotation to reverse
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+
+    // Rotate handles back to their unrotated positions
+    const unrotatedPts = handlePts.map(pt => {
+      const dx = pt.x - centerPt.x;
+      const dy = pt.y - centerPt.y;
+      const unrotatedX = centerPt.x + dx * cos - dy * sin;
+      const unrotatedY = centerPt.y + dx * sin + dy * cos;
+      return map.layerPointToLatLng(L.point(unrotatedX, unrotatedY));
+    });
+
+    // Create bounds from unrotated positions
+    const lats = unrotatedPts.map(pt => pt.lat);
+    const lngs = unrotatedPts.map(pt => pt.lng);
+    
+    return L.latLngBounds(
+      [Math.min(...lats), Math.min(...lngs)],
+      [Math.max(...lats), Math.max(...lngs)]
+    );
+  };
+
+
 
   // Function to add resize handles
   const addResizeHandles = useCallback((bounds: L.LatLngBounds) => {
@@ -126,13 +225,8 @@ export default function LeafletViewerComponent() {
     handleMarkersRef.current.filter(marker => marker !== null).forEach(marker => map.removeLayer(marker!));
     handleMarkersRef.current = [];
 
-    // Create corner handles
-    const corners = [
-      bounds.getNorthWest(), // NW
-      bounds.getNorthEast(), // NE
-      bounds.getSouthEast(), // SE
-      bounds.getSouthWest(), // SW
-    ];
+    // Calculate rotated positions for handles
+    const { corners, edges } = computeRotatedImageCorners(bounds, rotationDegRef.current);
 
     const cornerHandles = corners.map((latlng, idx) => {
       const marker = L.marker(latlng, {
@@ -242,6 +336,9 @@ export default function LeafletViewerComponent() {
         // Update image overlay bounds
         imageOverlayRef.current.setBounds(newBounds);
         
+        // Re-apply rotation to maintain visual appearance
+        applyRotation(rotationDegRef.current);
+        
         // Update handle positions
         updateHandlePositions(newBounds);
       });
@@ -256,16 +353,11 @@ export default function LeafletViewerComponent() {
       return marker;
     });
 
-    // Create edge handles
-    const edges = [
-      { position: L.latLng(bounds.getNorth(), (bounds.getWest() + bounds.getEast()) / 2), edge: 'north' },
-      { position: L.latLng((bounds.getSouth() + bounds.getNorth()) / 2, bounds.getEast()), edge: 'east' },
-      { position: L.latLng(bounds.getSouth(), (bounds.getWest() + bounds.getEast()) / 2), edge: 'south' },
-      { position: L.latLng((bounds.getSouth() + bounds.getNorth()) / 2, bounds.getWest()), edge: 'west' },
-    ];
-
-    const edgeHandles = edges.map(({ position, edge }) => {
-      const marker = L.marker(position, {
+    // Create edge handles using rotated positions
+    const edgeHandles = edges.map((latlng, idx) => {
+      const edgeTypes = ['north', 'east', 'south', 'west'];
+      const edge = edgeTypes[idx];
+      const marker = L.marker(latlng, {
         draggable: true,
         icon: L.divIcon({
           className: 'resize-handle edge-handle',
@@ -334,6 +426,9 @@ export default function LeafletViewerComponent() {
         // Update image overlay bounds
         imageOverlayRef.current.setBounds(newBounds);
         
+        // Re-apply rotation to maintain visual appearance
+        applyRotation(rotationDegRef.current);
+        
         // Update handle positions
         updateHandlePositions(newBounds);
       });
@@ -350,7 +445,7 @@ export default function LeafletViewerComponent() {
 
     // Store all handles
     handleMarkersRef.current = [...cornerHandles, ...edgeHandles];
-  }, [imageAspectRatio]);
+  }, [imageAspectRatio, computeRotatedImageCorners]);
 
   // Function to add move handle in the center of the image
   const addMoveHandle = useCallback((bounds: L.LatLngBounds) => {
@@ -471,7 +566,9 @@ export default function LeafletViewerComponent() {
     }
   }, []);
 
-  // Function to remove move handle
+
+
+  // Function to remove move handle (kept for compatibility but no longer used)
   const removeMoveHandle = useCallback(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -490,19 +587,8 @@ export default function LeafletViewerComponent() {
   const updateHandlePositions = (newBounds: L.LatLngBounds) => {
     if (handleMarkersRef.current.length === 0) return;
 
-    const corners = [
-      newBounds.getNorthWest(),
-      newBounds.getNorthEast(),
-      newBounds.getSouthEast(),
-      newBounds.getSouthWest(),
-    ];
-
-    const edges = [
-      L.latLng(newBounds.getNorth(), (newBounds.getWest() + newBounds.getEast()) / 2),
-      L.latLng((newBounds.getSouth() + newBounds.getNorth()) / 2, newBounds.getEast()),
-      L.latLng(newBounds.getSouth(), (newBounds.getWest() + newBounds.getEast()) / 2),
-      L.latLng((newBounds.getSouth() + newBounds.getNorth()) / 2, newBounds.getWest()),
-    ];
+    // Calculate rotated positions for handles
+    const { corners, edges } = computeRotatedImageCorners(newBounds, rotationDegRef.current);
 
     // Update corner handle positions
     corners.forEach((latlng, i) => {
@@ -519,7 +605,7 @@ export default function LeafletViewerComponent() {
       }
     });
 
-    // Update move handle position (index 8)
+    // Update move handle position (index 8) - keep at geographic center
     if (handleMarkersRef.current.length > 8 && handleMarkersRef.current[8]) {
       handleMarkersRef.current[8]!.setLatLng(newBounds.getCenter());
     }
@@ -543,7 +629,125 @@ export default function LeafletViewerComponent() {
     imgEl.style.transform = `${withoutRotate} rotate(${deg}deg)`.
       replace(/\s+/g, ' ').trim();
     imgEl.style.willChange = 'transform';
-  }, []);
+    
+    // Update handle positions to follow the rotated image
+    if (imageOverlayRef.current) {
+      updateHandlePositions(imageOverlayRef.current.getBounds());
+    }
+  }, [updateHandlePositions]);
+
+  // Function to add Ctrl+click and drag functionality to image overlay
+  const addImageOverlayDragHandlers = useCallback((overlay: L.ImageOverlay) => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    let isDragging = false;
+    let dragStartPos: L.LatLng | null = null;
+    let dragStartBounds: L.LatLngBounds | null = null;
+
+    // Add mouse event handlers to the image overlay
+    overlay.on('mousedown', (e) => {
+      // Only activate if Ctrl key is pressed
+      if (!e.originalEvent.ctrlKey) return;
+      
+      e.originalEvent.preventDefault();
+      isDragging = true;
+      
+      // Store starting positions
+      dragStartPos = map.mouseEventToLatLng(e.originalEvent);
+      dragStartBounds = overlay.getBounds();
+      
+      // Disable map dragging while moving image
+      map.dragging.disable();
+      
+      // Change cursor
+      map.getContainer().style.cursor = 'grabbing';
+    });
+
+    overlay.on('mousemove', (e) => {
+      if (!isDragging || !dragStartPos || !dragStartBounds) return;
+      
+      const currentPos = map.mouseEventToLatLng(e.originalEvent);
+      
+      // Calculate the offset from where the drag started
+      const offset = {
+        lat: currentPos.lat - dragStartPos.lat,
+        lng: currentPos.lng - dragStartPos.lng
+      };
+      
+      // Create new bounds by moving the original bounds by the offset
+      const newBounds = L.latLngBounds(
+        [dragStartBounds.getSouth() + offset.lat, dragStartBounds.getWest() + offset.lng],
+        [dragStartBounds.getNorth() + offset.lat, dragStartBounds.getEast() + offset.lng]
+      );
+      
+      // Update image overlay bounds
+      overlay.setBounds(newBounds);
+      
+      // Re-apply current rotation
+      applyRotation(rotationDegRef.current);
+      
+      // Update all handle positions
+      updateHandlePositions(newBounds);
+    });
+
+    overlay.on('mouseup', () => {
+      if (!isDragging) return;
+      
+      isDragging = false;
+      dragStartPos = null;
+      dragStartBounds = null;
+      
+      // Re-enable map dragging
+      map.dragging.enable();
+      
+      // Reset cursor
+      map.getContainer().style.cursor = '';
+    });
+
+    // Handle mouse leaving the overlay
+    overlay.on('mouseleave', () => {
+      if (isDragging) {
+        isDragging = false;
+        dragStartPos = null;
+        dragStartBounds = null;
+        
+        // Re-enable map dragging
+        map.dragging.enable();
+        
+        // Reset cursor
+        map.getContainer().style.cursor = '';
+      }
+    });
+
+    // Add global key event listeners for Ctrl key visual feedback
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Control') {
+        const imgEl = overlay.getElement();
+        if (imgEl) {
+          imgEl.classList.add('ctrl-pressed');
+        }
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Control') {
+        const imgEl = overlay.getElement();
+        if (imgEl) {
+          imgEl.classList.remove('ctrl-pressed');
+        }
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('keyup', handleKeyUp);
+
+    // Cleanup function to remove event listeners
+    overlay.on('remove', () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('keyup', handleKeyUp);
+    });
+  }, [applyRotation, updateHandlePositions]);
 
   // Compute rotation handle position given current bounds and rotation
   const computeRotateHandleLatLng = useCallback((bounds: L.LatLngBounds): L.LatLng | null => {
@@ -708,6 +912,43 @@ export default function LeafletViewerComponent() {
     img.src = URL.createObjectURL(f);
   };
 
+  // Function to switch map style
+  const switchMapStyle = (style: 'road' | 'aerial') => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    console.log('Switching to:', style, 'Current style:', mapStyle);
+
+    // Remove current layer
+    if (mapStyle === 'road' && roadLayerRef.current) {
+      console.log('Removing road layer');
+      map.removeLayer(roadLayerRef.current);
+    } else if (mapStyle === 'aerial' && aerialLayerRef.current) {
+      console.log('Removing aerial layer');
+      map.removeLayer(aerialLayerRef.current);
+    }
+
+    // Add new layer
+    if (style === 'road' && roadLayerRef.current) {
+      console.log('Adding road layer');
+      roadLayerRef.current.addTo(map);
+    } else if (style === 'aerial' && aerialLayerRef.current) {
+      console.log('Adding aerial layer');
+      aerialLayerRef.current.addTo(map);
+    }
+
+    setMapStyle(style);
+  };
+
+  // Function to toggle map style
+  const toggleMapStyle = (style: 'road' | 'aerial') => {
+    if (mapStyle === style) {
+      // If clicking the same style, do nothing
+      return;
+    }
+    switchMapStyle(style);
+  };
+
   // Function to center image at postcode
   const centerImageAtPostcode = async (postcode: string) => {
     if (!imageOverlayRef.current || !mapRef.current) {
@@ -785,6 +1026,8 @@ export default function LeafletViewerComponent() {
 
     if (showResizeHandles) {
       addResizeHandles(imageOverlayRef.current.getBounds());
+      // Update handle positions to account for rotation
+      updateHandlePositions(imageOverlayRef.current.getBounds());
     } else {
       // Remove resize handles but keep move handle if enabled
       const resizeHandles = handleMarkersRef.current.slice(0, 8);
@@ -796,18 +1039,9 @@ export default function LeafletViewerComponent() {
       // Clear resize handles (indices 0-7) but keep move handle at index 8
       handleMarkersRef.current.splice(0, 8);
     }
-  }, [showResizeHandles, addResizeHandles]);
+  }, [showResizeHandles, addResizeHandles, updateHandlePositions]);
 
-  // Effect to show/hide move handle
-  useEffect(() => {
-    if (!imageOverlayRef.current || !mapRef.current) return;
 
-    if (showMoveHandle) {
-      addMoveHandle(imageOverlayRef.current.getBounds());
-    } else {
-      removeMoveHandle();
-    }
-  }, [showMoveHandle, addMoveHandle, removeMoveHandle]);
 
   // Effect to show/hide rotate handle
   useEffect(() => {
@@ -820,9 +1054,9 @@ export default function LeafletViewerComponent() {
     }
   }, [showRotateHandle, addRotateHandle, removeRotateHandle]);
 
-  // Keyboard controls for precise movement
+  // Keyboard controls for precise movement (always active when image is loaded)
   useEffect(() => {
-    if (!showMoveHandle || !imageOverlayRef.current) return;
+    if (!imageOverlayRef.current) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!imageOverlayRef.current) return;
@@ -868,26 +1102,27 @@ export default function LeafletViewerComponent() {
       
       // Update all handle positions
       updateHandlePositions(newBounds);
-      
-      // Update move handle position
-      if (handleMarkersRef.current.length > 8) {
-        const moveHandle = handleMarkersRef.current[8];
-        if (moveHandle) {
-          moveHandle.setLatLng(newBounds.getCenter());
-        }
-      }
     };
 
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [showMoveHandle, updateHandlePositions]);
+  }, [updateHandlePositions]);
 
   return (
     <div suppressHydrationWarning={true}>
       <div className="w-full h-screen grid grid-cols-12 grid-rows-1">
         {/* Sidebar */}
         <div className="col-span-4 xl:col-span-3 bg-white p-4 border-r border-gray-200 overflow-y-auto">
-          <h1 className="text-xl font-bold mb-4">Image Overlay Tool</h1>
+          <div className="flex items-center gap-3 mb-4">
+            <img 
+              src="/1st_planner_ltd_logo.jfif" 
+              alt="1st Planner Ltd Logo" 
+              className="w-12 h-12 object-contain"
+            />
+            <h1 className="text-xl font-bold text-blue-700">Image Overlay Tool</h1>
+          </div>
+
+
 
           {/* File Upload */}
           <div className="mb-6">
@@ -978,37 +1213,22 @@ export default function LeafletViewerComponent() {
             {/* Move Controls */}
             {imageFile && (
               <div className="mt-4 pt-4 border-t">
-                <div className="flex items-center justify-between mb-2">
+                <div className="mb-2">
                   <label className="text-sm font-medium text-gray-700">Image Moving</label>
-                  <button
-                    onClick={() => setShowMoveHandle(!showMoveHandle)}
-                    className={`px-3 py-1 text-xs rounded-md ${
-                      showMoveHandle 
-                        ? 'bg-green-600 text-white hover:bg-green-700' 
-                        : 'bg-gray-300 text-gray-700 hover:bg-gray-400'
-                    }`}
-                  >
-                    {showMoveHandle ? 'Hide Move' : 'Show Move'}
-                  </button>
                 </div>
                 <p className="text-xs text-gray-500">
-                  {showMoveHandle 
-                    ? '🔵 Drag the blue center handle to move the entire image'
-                    : 'Click "Show Move" to enable image moving'
-                  }
+                  Hold Ctrl and drag anywhere on the image to move it
                 </p>
-                {showMoveHandle && (
-                  <div className="mt-2 p-2 bg-green-50 rounded border border-green-200">
-                    <p className="text-xs text-green-700">
-                      <strong>Tip:</strong> Drag the blue center handle (↔) to smoothly move your image around the map.
-                    </p>
-                    <div className="mt-2 pt-2 border-t border-green-200">
-                      <p className="text-xs text-green-600 font-medium">Precision Controls:</p>
-                      <p className="text-xs text-green-600">• Drag handle: Fine-tuned movement</p>
-                      <p className="text-xs text-green-600">• Arrow keys: Pixel-perfect positioning</p>
-                    </div>
+                <div className="mt-2 p-2 bg-green-50 rounded border border-green-200">
+                  <p className="text-xs text-green-700">
+                    <strong>Tip:</strong> Hold the Ctrl key and drag anywhere on the image to smoothly move it around the map.
+                  </p>
+                  <div className="mt-2 pt-2 border-t border-green-200">
+                    <p className="text-xs text-green-600 font-medium">Precision Controls:</p>
+                    <p className="text-xs text-green-600">• Ctrl + Drag: Fine-tuned movement from anywhere on image</p>
+                    <p className="text-xs text-green-600">• Arrow keys: Pixel-perfect positioning</p>
                   </div>
-                )}
+                </div>
               </div>
             )}
 
@@ -1052,14 +1272,48 @@ export default function LeafletViewerComponent() {
         <div className="col-span-8 xl:col-span-9 relative">
           <div ref={containerRef} className="w-full h-full" />
 
+          {/* Map Style Toggle - Top Left */}
+          <div className="absolute top-4 left-20 bg-white bg-opacity-95 backdrop-blur-sm rounded-lg shadow-lg p-3 border border-gray-200 z-[1000]">
+            <div className="text-sm font-medium text-gray-700 mb-2">Map Style</div>
+            <div className="space-y-2">
+              <label className="flex items-center space-x-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={mapStyle === 'road'}
+                  onChange={() => toggleMapStyle('road')}
+                  className="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 focus:ring-2"
+                />
+                <span className="text-sm text-gray-700">🛣️ Road Map</span>
+              </label>
+              <label className="flex items-center space-x-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={mapStyle === 'aerial'}
+                  onChange={() => toggleMapStyle('aerial')}
+                  className="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 focus:ring-2"
+                />
+                <span className="text-sm text-gray-700">🛸 Aerial Map</span>
+              </label>
+            </div>
+          </div>
+
           {!imageFile && (
             <div className="absolute inset-0 flex items-center justify-center bg-gray-100">
-              <div className="text-center">
-                <div className="text-6xl mb-4">🗺️</div>
-                <h2 className="text-xl font-semibold text-gray-600 mb-2">Image Overlay Tool</h2>
-                <p className="text-gray-500">Upload an image to overlay it on the map</p>
-                <p className="text-sm text-gray-400 mt-2">Powered by Leaflet & ESRI World Imagery</p>
+                          <div className="text-center">
+              <div className="text-6xl mb-4">🗺️</div>
+              <div className="flex items-center justify-center gap-3 mb-2">
+                <img 
+                  src="/1st_planner_ltd_logo.jfif" 
+                  alt="1st Planner Ltd Logo" 
+                  className="w-10 h-10 object-contain"
+                />
+                <h2 className="text-xl font-semibold text-blue-700 mb-2">Image Overlay Tool</h2>
               </div>
+              <p className="text-gray-500">Upload an image to overlay it on the map</p>
+              <p className="text-sm text-gray-400 mt-2">
+                Powered by Leaflet & {mapStyle === 'road' ? 'OpenStreetMap' : 'ESRI World Imagery'}
+              </p>
+            </div>
             </div>
           )}
 
