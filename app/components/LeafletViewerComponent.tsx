@@ -64,6 +64,9 @@ export default function LeafletViewerComponent() {
   const [showContextMenu, setShowContextMenu] = useState(false);
   const [contextMenuPosition, setContextMenuPosition] = useState({ x: 0, y: 0 });
   const [contextMenuPolygon, setContextMenuPolygon] = useState<{ polygon: L.Polygon; index: number; name: string; polygonId: string } | null>(null);
+  const [showImageContextMenu, setShowImageContextMenu] = useState(false);
+  const [imageContextMenuPosition, setImageContextMenuPosition] = useState({ x: 0, y: 0 });
+  const [imageContextMenuImage, setImageContextMenuImage] = useState<{ id: string; name: string; polygons?: any[] } | null>(null);
 
   // Function to load all saved images as overlays (for display purposes)
   const loadAllSavedImagesAsOverlays = useCallback(() => {
@@ -1635,6 +1638,57 @@ export default function LeafletViewerComponent() {
     setContextMenuPolygon(null);
   }, []);
 
+  // Function to close image context menu
+  const closeImageContextMenu = useCallback(() => {
+    setShowImageContextMenu(false);
+    setImageContextMenuImage(null);
+  }, []);
+
+  // Function to export polygons as GeoJSON
+  const exportPolygonsAsGeoJSON = useCallback((imageData: { id: string; name: string; polygons?: any[] }) => {
+    if (!imageData.polygons || imageData.polygons.length === 0) {
+      alert('No polygons to export for this image.');
+      return;
+    }
+
+    // Create a FeatureCollection from the saved polygon data
+    const featureCollection = {
+      type: 'FeatureCollection',
+      features: imageData.polygons.map((polyData, index) => ({
+        type: 'Feature',
+        geometry: {
+          type: 'Polygon',
+          coordinates: [polyData.latlngs.map((latlng: any) => [latlng.lng, latlng.lat])] // GeoJSON uses [lng, lat] order
+        },
+        properties: {
+          name: polyData.name || `Polygon ${index + 1}`,
+          area: polyData.area || 0,
+          unit: polyData.unit || 'm²',
+          imageName: imageData.name,
+          exportedAt: new Date().toISOString()
+        }
+      }))
+    };
+
+    // Create and download the GeoJSON file
+    const blob = new Blob([JSON.stringify(featureCollection, null, 2)], { 
+      type: 'application/vnd.geo+json' 
+    });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${imageData.name.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_polygons.geojson`;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    // Close the context menu
+    closeImageContextMenu();
+  }, [closeImageContextMenu]);
+
 
 
   // Close context menu when clicking outside
@@ -1643,13 +1697,20 @@ export default function LeafletViewerComponent() {
       if (showContextMenu) {
         closeContextMenu();
       }
+      if (showImageContextMenu) {
+        closeImageContextMenu();
+      }
     };
     
     if (showContextMenu) {
       document.addEventListener('click', handleClickOutside);
       return () => document.removeEventListener('click', handleClickOutside);
     }
-  }, [showContextMenu, closeContextMenu]);
+    if (showImageContextMenu) {
+      document.addEventListener('click', handleClickOutside);
+      return () => document.removeEventListener('click', handleClickOutside);
+    }
+  }, [showContextMenu, showImageContextMenu, closeContextMenu, closeImageContextMenu]);
 
   const savePolygonsToImage = useCallback(() => {
     if (!activeImageId) return;
@@ -2472,6 +2533,9 @@ export default function LeafletViewerComponent() {
               </button>
             </div>
             <p className="text-xs text-gray-600">Click any saved image to load it on the map</p>
+            <p className="text-xs text-blue-600 mt-1">
+              💡 Right-click images with polygons to export as GeoJSON
+            </p>
           </div>
 
           {savedImages.length === 0 ? (
@@ -2491,6 +2555,18 @@ export default function LeafletViewerComponent() {
                       : 'border-gray-200 bg-gray-50 hover:border-gray-300'
                   }`}
                   onClick={() => loadSavedImage(savedImage)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (savedImage.polygons && savedImage.polygons.length > 0) {
+                      setImageContextMenuPosition({ x: e.clientX, y: e.clientY });
+                      setImageContextMenuImage(savedImage);
+                      setShowImageContextMenu(true);
+                    }
+                  }}
+                  style={{
+                    cursor: savedImage.polygons && savedImage.polygons.length > 0 ? 'context-menu' : 'pointer'
+                  }}
                 >
                   <div className="flex items-start justify-between mb-2">
                     <div className="flex-1 min-w-0">
@@ -2529,7 +2605,10 @@ export default function LeafletViewerComponent() {
                     {savedImage.polygons && savedImage.polygons.length > 0 && (
                       <div className="flex justify-between">
                         <span>Polygons:</span>
-                        <span className="font-medium">{savedImage.polygons.length}</span>
+                        <span className="font-medium flex items-center">
+                          {savedImage.polygons.length}
+                          <span className="ml-1 text-blue-500" title="Right-click to export as GeoJSON">📁</span>
+                        </span>
                       </div>
                     )}
                   </div>
@@ -2738,6 +2817,27 @@ export default function LeafletViewerComponent() {
         >
           <span>🗑️</span>
           <span>Delete "{contextMenuPolygon.name}"</span>
+        </button>
+      </div>
+    )}
+
+    {/* Image Context Menu for GeoJSON Export */}
+    {showImageContextMenu && imageContextMenuImage && (
+      <div 
+        className="fixed bg-white rounded-lg shadow-lg border border-gray-200 py-1 z-[10001]"
+        style={{ 
+          left: imageContextMenuPosition.x, 
+          top: imageContextMenuPosition.y,
+          minWidth: '150px'
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          onClick={() => exportPolygonsAsGeoJSON(imageContextMenuImage)}
+          className="w-full px-4 py-2 text-sm text-left text-blue-600 hover:bg-blue-50 hover:text-blue-700 transition-colors flex items-center space-x-2"
+        >
+          <span>📁</span>
+          <span>Export Polygons as GeoJSON</span>
         </button>
       </div>
     )}
