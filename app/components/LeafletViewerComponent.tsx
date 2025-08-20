@@ -68,6 +68,483 @@ export default function LeafletViewerComponent() {
   const [imageContextMenuPosition, setImageContextMenuPosition] = useState({ x: 0, y: 0 });
   const [imageContextMenuImage, setImageContextMenuImage] = useState<{ id: string; name: string; polygons?: any[] } | null>(null);
 
+  // ===== WORKBENCH ARCHITECTURE =====
+  
+  // Upload mode and GeoJSON type
+  type UploadMode = 'image' | 'geojson';
+  type GeoJSONKind = 'local' | 'wgs84' | null;
+  
+  const [uploadMode, setUploadMode] = useState<UploadMode>('image');
+  const geoJSONKindRef = useRef<GeoJSONKind>(null);
+  const geoJSONFileRef = useRef<File | null>(null);
+  
+  // Shared refs for both modes
+  const localGeoRef = useRef<GeoJSON.FeatureCollection | null>(null);
+  const localExtentRef = useRef<{minX:number; minY:number; width:number; height:number} | null>(null);
+  const geoLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const activeBoundsRef = useRef<L.LatLngBounds | null>(null);
+  const boundsOverlayRef = useRef<L.Rectangle | null>(null);
+
+  // ===== SHARED BOUNDS/ROTATION HELPERS =====
+  
+  // One source of truth for the "active frame"
+  const getActiveBounds = useCallback(() => {
+    console.log('getActiveBounds: Called with uploadMode:', uploadMode);
+    
+    if (uploadMode === 'image') {
+      const bounds = imageOverlayRef.current?.getBounds() ?? null;
+      console.log('getActiveBounds: Returning image bounds:', bounds);
+      return bounds;
+    }
+    
+    const bounds = activeBoundsRef.current; // for GeoJSON local-XY frame
+    console.log('getActiveBounds: Returning GeoJSON bounds:', bounds);
+    return bounds;
+  }, [uploadMode]);
+
+  // Shared rotation function
+  const applyRotation = useCallback((deg: number) => {
+    if (uploadMode === 'image') {
+      const imgEl = imageOverlayRef.current?.getElement() as HTMLImageElement | undefined;
+      if (!imgEl) return;
+      // Force pivot at center
+      imgEl.style.setProperty('transform-origin', '50% 50%', 'important');
+      // Compose rotation with Leaflet's transform without clobbering it
+      const base = imgEl.style.transform || '';
+      const withoutRotate = base.replace(/\s?rotate\([^)]*\)/, '');
+      imgEl.style.transform = `${withoutRotate} rotate(${deg}deg)`.
+        replace(/\s+/g, ' ').trim();
+      imgEl.style.willChange = 'transform';
+      
+      // Update handle positions to follow the rotated image
+      if (imageOverlayRef.current) {
+        // Call updateHandlePositions directly if available
+        if (typeof updateHandlePositions === 'function') {
+          updateHandlePositions(imageOverlayRef.current.getBounds());
+        }
+      }
+    } else if (uploadMode === 'geojson' && geoJSONKindRef.current === 'local') {
+      // For local GeoJSON, rotation affects the transform frame
+      rotationDegRef.current = deg;
+      if (localGeoRef.current) {
+        // Call renderLocalGeoJSON directly if available
+        if (typeof renderLocalGeoJSON === 'function') {
+          renderLocalGeoJSON();
+        }
+      }
+      
+      // Update handle positions to follow the rotated frame
+      const bounds = getActiveBounds();
+      if (bounds) {
+        // Call updateHandlePositions directly if available
+        if (typeof updateHandlePositions === 'function') {
+          updateHandlePositions(bounds);
+        }
+      }
+    }
+  }, [uploadMode, getActiveBounds]);
+
+  const setActiveBounds = useCallback((b: L.LatLngBounds) => {
+    if (uploadMode === 'image' && imageOverlayRef.current) {
+      imageOverlayRef.current.setBounds(b);
+      applyRotation(rotationDegRef.current);
+    } else {
+      activeBoundsRef.current = b;
+      // also redraw any local-XY GeoJSON using the new transform frame
+      if (localGeoRef.current) {
+        // Call renderLocalGeoJSON directly if available
+        if (typeof renderLocalGeoJSON === 'function') {
+          renderLocalGeoJSON();
+        }
+      }
+    }
+    // Call updateHandlePositions directly if available
+    if (typeof updateHandlePositions === 'function') {
+      updateHandlePositions(b);
+    }
+  }, [uploadMode, applyRotation]);
+
+  // ===== GEOJSON HELPER FUNCTIONS =====
+  
+  // 1. forEachCoord - no dependencies
+  const forEachCoord = useCallback((geom: GeoJSON.Geometry, cb: (x: number, y: number) => void) => {
+    const walk = (c: any) => {
+      if (typeof c[0] === 'number') { cb(c[0], c[1]); return; }
+      for (const cc of c) walk(cc);
+    };
+    walk((geom as any).coordinates);
+  }, []);
+
+  // 2. getLocalExtent - depends on forEachCoord
+  const getLocalExtent = useCallback((fc: GeoJSON.FeatureCollection) => {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    fc.features.forEach(f => {
+      if (!f.geometry) return;
+      forEachCoord(f.geometry, (x, y) => {
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      });
+    });
+    const width = maxX - minX;
+    const height = maxY - minY;
+    return { minX, minY, width: Math.max(width, 1e-9), height: Math.max(height, 1e-9) };
+  }, [forEachCoord]);
+
+  // 3. localToLatLng - no dependencies on our functions
+  const localToLatLng = useCallback((
+    x: number, y: number,
+    bounds: L.LatLngBounds,
+    extent: {minX:number; minY:number; width:number; height:number},
+    rotationDeg: number,
+    map: L.Map
+  ): L.LatLng => {
+    // normalize into [0..1]
+    const u = (x - extent.minX) / extent.width;
+    const v = (y - extent.minY) / extent.height;
+
+    // place inside unrotated bounds
+    const sw = bounds.getSouthWest();
+    const ne = bounds.getNorthEast();
+    const lat = sw.lat + v * (ne.lat - sw.lat);
+    const lng = sw.lng + u * (ne.lng - sw.lng);
+
+    // rotate around center (using layerPoint space, same as your image code)
+    if (!rotationDeg) return L.latLng(lat, lng);
+    const center = bounds.getCenter();
+    const cPt = map.latLngToLayerPoint(center);
+    const p = map.latLngToLayerPoint(L.latLng(lat, lng));
+    const theta = (rotationDeg * Math.PI) / 180;
+    const cos = Math.cos(theta), sin = Math.sin(theta);
+    const dx = p.x - cPt.x, dy = p.y - cPt.y;
+    const rx = cPt.x + dx * cos - dy * sin;
+    const ry = cPt.y + dx * sin + dy * cos;
+    return map.layerPointToLatLng(L.point(rx, ry));
+  }, []);
+
+  // 4. renderLocalGeoJSON - depends on localToLatLng
+  const renderLocalGeoJSON = useCallback(() => {
+    const map = mapRef.current;
+    if (!map || !localGeoRef.current || !activeBoundsRef.current || !localExtentRef.current) {
+      console.log('renderLocalGeoJSON: Missing required refs', {
+        map: !!map,
+        localGeo: !!localGeoRef.current,
+        activeBounds: !!activeBoundsRef.current,
+        localExtent: !!localExtentRef.current
+      });
+      return;
+    }
+
+    console.log('renderLocalGeoJSON: Rendering GeoJSON features', {
+      bounds: activeBoundsRef.current,
+      extent: localExtentRef.current,
+      rotation: rotationDegRef.current
+    });
+
+    // clear previous
+    if (!geoLayerGroupRef.current) {
+      geoLayerGroupRef.current = L.layerGroup().addTo(map);
+    }
+    geoLayerGroupRef.current.clearLayers();
+
+    const fc = localGeoRef.current;
+    const b = activeBoundsRef.current;
+    const ex = localExtentRef.current;
+    const deg = rotationDegRef.current;
+
+    const makeLatLngRings = (coords: number[][][]) =>
+      coords.map(ring => ring.map(([x,y]) => localToLatLng(x, y, b, ex, deg, map)));
+
+    let featureCount = 0;
+    fc.features.forEach(f => {
+      if (!f.geometry) return;
+      const g = f.geometry;
+      switch (g.type) {
+        case 'Polygon': {
+          const rings = makeLatLngRings(g.coordinates as any);
+          const polygon = L.polygon(rings, { color: '#0ea5e9', weight: 2, fillOpacity: 0.2 });
+          polygon.addTo(geoLayerGroupRef.current!);
+          featureCount++;
+          console.log('renderLocalGeoJSON: Added polygon', { rings: rings.length });
+          break;
+        }
+        case 'MultiPolygon': {
+          (g.coordinates as any).forEach((poly: number[][][]) => {
+            const rings = makeLatLngRings(poly);
+            const polygon = L.polygon(rings, { color: '#0ea5e9', weight: 2, fillOpacity: 0.2 });
+            polygon.addTo(geoLayerGroupRef.current!);
+            featureCount++;
+          });
+          console.log('renderLocalGeoJSON: Added MultiPolygon features');
+          break;
+        }
+        case 'LineString': {
+          const ll = (g.coordinates as any).map(([x,y]:number[]) => localToLatLng(x,y,b,ex,deg,map));
+          const line = L.polyline(ll, { color: '#22c55e', weight: 2 });
+          line.addTo(geoLayerGroupRef.current!);
+          featureCount++;
+          console.log('renderLocalGeoJSON: Added LineString', { points: ll.length });
+          break;
+        }
+        case 'MultiLineString': {
+          (g.coordinates as any).forEach((line: number[][]) => {
+            const ll = line.map(([x,y]) => localToLatLng(x,y,b,ex,deg,map));
+            const polyline = L.polyline(ll, { color: '#22c55e', weight: 2 });
+            polyline.addTo(geoLayerGroupRef.current!);
+            featureCount++;
+          });
+          console.log('renderLocalGeoJSON: Added MultiLineString features');
+          break;
+        }
+        case 'Point': {
+          const [x,y] = (g.coordinates as number[]);
+          const point = L.circleMarker(localToLatLng(x,y,b,ex,deg,map), { radius: 4 });
+          point.addTo(geoLayerGroupRef.current!);
+          featureCount++;
+          console.log('renderLocalGeoJSON: Added Point');
+          break;
+        }
+        default:
+          console.log('renderLocalGeoJSON: Unknown geometry type', g.type);
+          break;
+      }
+    });
+    
+    console.log(`renderLocalGeoJSON: Rendered ${featureCount} features`);
+  }, [localToLatLng]);
+
+  // ===== GEOJSON UPLOAD FUNCTION =====
+  
+  const onGeoJSONChosen = useCallback(async (f: File | null) => {
+    console.log('onGeoJSONChosen: Function called with file:', f?.name);
+    
+    if (!f) {
+      console.log('onGeoJSONChosen: Clearing GeoJSON state');
+      // clear state & layers
+      localGeoRef.current = null;
+      localExtentRef.current = null;
+      geoJSONFileRef.current = null;
+      geoJSONKindRef.current = null;
+      if (geoLayerGroupRef.current) geoLayerGroupRef.current.clearLayers();
+      if (boundsOverlayRef.current && mapRef.current) {
+        mapRef.current.removeLayer(boundsOverlayRef.current);
+        boundsOverlayRef.current = null;
+      }
+      setIsImageLoaded(false);
+      setShowResizeHandles(false);
+      setShowRotateHandle(false);
+      return;
+    }
+
+    try {
+      const text = await f.text();
+      const fc = JSON.parse(text) as GeoJSON.FeatureCollection;
+      geoJSONFileRef.current = f;
+
+      // If the user chose explicitly, honor it; otherwise auto-detect
+      let kind: GeoJSONKind | 'auto' = geoJSONKindRef.current ?? 'auto';
+
+      if (kind === 'auto') {
+        console.log('onGeoJSONChosen: Auto-detecting coordinate system');
+        
+        // 1) Check lon/lat RANGE
+        let looksLonLat = true;
+        let sampleCount = 0;
+        const visit = (c: any) => {
+          if (sampleCount > 500) return;
+          if (typeof c[0] === 'number') {
+            sampleCount++;
+            const [x, y] = c;
+            if (x < -180 || x > 180 || y < -90 || y > 90) looksLonLat = false;
+            return;
+          }
+          c.forEach(visit);
+        };
+        fc.features.forEach(ft => ft.geometry && visit((ft.geometry as any).coordinates));
+
+        // 2) Require the bbox to be at least ~0.5° in either dimension
+        const ex = getLocalExtent(fc);
+        const bboxLargeEnough = (ex.width >= 0.5 || ex.height >= 0.5);
+
+        kind = (looksLonLat && bboxLargeEnough) ? 'wgs84' : 'local';
+        
+        console.log('onGeoJSONChosen: Auto-detection result:', { 
+          looksLonLat, 
+          bboxLargeEnough, 
+          bbox: { width: ex.width, height: ex.height },
+          sampleCount,
+          detectedKind: kind 
+        });
+      } else {
+        console.log('onGeoJSONChosen: Using user-selected coordinate system:', kind);
+      }
+
+      geoJSONKindRef.current = kind;
+
+      if (kind === 'wgs84') {
+        console.log('onGeoJSONChosen: Treating as WGS84 coordinates');
+        // draw directly
+        if (!geoLayerGroupRef.current) geoLayerGroupRef.current = L.layerGroup().addTo(mapRef.current!);
+        geoLayerGroupRef.current.clearLayers();
+        const layer = L.geoJSON(fc, { style: { color: '#0ea5e9', weight: 2, fillOpacity: 0.2 } })
+                      .addTo(geoLayerGroupRef.current);
+        mapRef.current!.fitBounds(layer.getBounds(), { padding: [20, 20] });
+        // hide resize/rotate; no frame here
+        setShowResizeHandles(false);
+        setShowRotateHandle(false);
+        setIsImageLoaded(true);
+        return;
+      }
+
+      // local-XY path: create/keep a transform frame
+      console.log('onGeoJSONChosen: Treating as local XY coordinates');
+      geoJSONKindRef.current = 'local';
+      localGeoRef.current = fc;
+      localExtentRef.current = getLocalExtent(fc);
+      
+      console.log('onGeoJSONChosen: Local extent calculated:', localExtentRef.current);
+      
+      const ar = localExtentRef.current.width / localExtentRef.current.height || 1;
+      const baseW = 0.01, baseH = baseW / ar;
+      const frame = L.latLngBounds([-baseH / 2, -baseW / 2], [baseH / 2, baseW / 2]);
+
+      console.log('onGeoJSONChosen: Frame bounds calculated:', frame);
+      
+      activeBoundsRef.current = frame;
+      rotationDegRef.current = 0;
+
+      // Create bounds overlay for dragging
+      if (boundsOverlayRef.current) {
+        boundsOverlayRef.current.setBounds(frame);
+      } else {
+        const rect = L.rectangle(frame, {
+          color: '#000',
+          weight: 1,
+          opacity: 0,
+          fillOpacity: 0,
+          interactive: true
+        }).addTo(mapRef.current!);
+        boundsOverlayRef.current = rect;
+        
+        // Add drag handlers
+        let isDragging = false;
+        let dragStartPos: L.LatLng | null = null;
+        let dragStartBounds: L.LatLngBounds | null = null;
+
+        rect.on('mousedown', (e: any) => {
+          if (!e.originalEvent.ctrlKey) return;
+          e.originalEvent.preventDefault();
+          isDragging = true;
+          dragStartPos = mapRef.current!.mouseEventToLatLng(e.originalEvent);
+          dragStartBounds = frame;
+          mapRef.current!.dragging.disable();
+          mapRef.current!.getContainer().style.cursor = 'grabbing';
+        });
+
+        rect.on('mousemove', (e: any) => {
+          if (!isDragging || !dragStartPos || !dragStartBounds) return;
+          const currentPos = mapRef.current!.mouseEventToLatLng(e.originalEvent);
+          const offset = { lat: currentPos.lat - dragStartPos.lat, lng: currentPos.lng - dragStartPos.lng };
+          const nb = L.latLngBounds(
+            [dragStartBounds.getSouth() + offset.lat, dragStartBounds.getWest() + offset.lng],
+            [dragStartBounds.getNorth() + offset.lat, dragStartBounds.getEast() + offset.lng]
+          );
+          setActiveBounds(nb);
+        });
+
+        const end = () => {
+          if (!isDragging) return;
+          isDragging = false;
+          dragStartPos = null;
+          dragStartBounds = null;
+          mapRef.current!.dragging.enable();
+          mapRef.current!.getContainer().style.cursor = '';
+        };
+
+        rect.on('mouseup', end);
+        rect.on('mouseleave', end);
+      }
+
+      console.log('onGeoJSONChosen: About to render local GeoJSON');
+      renderLocalGeoJSON();
+      console.log('onGeoJSONChosen: Local GeoJSON rendered, fitting map to frame');
+      mapRef.current!.fitBounds(frame, { padding: [20, 20] });
+
+      setShowResizeHandles(true);
+      setShowRotateHandle(true);
+      setIsImageLoaded(true);
+      
+      // Add resize handles and rotate handle
+      if (typeof addResizeHandles === 'function') {
+        addResizeHandles(frame);
+      }
+      if (typeof updateHandlePositions === 'function') {
+        updateHandlePositions(frame);
+      }
+      if (typeof addRotateHandle === 'function') {
+        addRotateHandle();
+      }
+    } catch (e) {
+      alert('Could not parse GeoJSON file.');
+      console.error(e);
+    }
+  }, [getLocalExtent, renderLocalGeoJSON, setActiveBounds]);
+
+  // ===== SHARED POSTCODE CENTERING =====
+  
+  const centerAtPostcode = useCallback(async (postcode: string) => {
+    console.log('centerAtPostcode: Function called with postcode:', postcode);
+    console.log('centerAtPostcode: Current state:', {
+      uploadMode,
+      geoJSONKind: geoJSONKindRef.current,
+      hasGeoJSON: !!geoJSONFileRef.current,
+      hasLocalGeo: !!localGeoRef.current,
+      hasActiveBounds: !!activeBoundsRef.current
+    });
+    
+    const map = mapRef.current!;
+    const clean = postcode.replace(/\s+/g, '').toUpperCase();
+    
+    try {
+      const r = await fetch(`https://api.postcodes.io/postcodes/${clean}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const { latitude: lat, longitude: lng } = (await r.json()).result;
+      
+      console.log('centerAtPostcode: Got coordinates:', { lat, lng });
+
+      // keep current frame size, move the center:
+      const b = getActiveBounds();
+      console.log('centerAtPostcode: Current active bounds:', b);
+      
+      if (b) {
+        const h = b.getNorth() - b.getSouth();
+        const w = b.getEast() - b.getWest();
+        const nb = L.latLngBounds([lat - h / 2, lng - w / 2], [lat + h / 2, lng + w / 2]);
+        
+        console.log('centerAtPostcode: New bounds calculated:', nb);
+        
+        // Use single path through setActiveBounds for both image and local-XY GeoJSON
+        console.log('centerAtPostcode: Using setActiveBounds for repositioning');
+        setActiveBounds(nb);
+        
+        map.fitBounds(nb, { padding: [20, 20] });
+        return;
+      }
+
+      // WGS84 GeoJSON path: just pan/zoom
+      console.log('centerAtPostcode: No active bounds, using WGS84 path');
+      map.setView([lat, lng], Math.max(map.getZoom(), 16));
+    } catch (error) {
+      console.error('centerAtPostcode: Error occurred:', error);
+      let msg = `Could not find postcode "${postcode}". `;
+      if (String(error).includes('HTTP 404')) msg += 'Postcode not found.';
+      else if (String(error).includes('HTTP 429')) msg += 'Too many requests—try again shortly.';
+      else msg += `Error: ${error}`;
+      alert(msg);
+    }
+  }, [getActiveBounds, setActiveBounds, uploadMode, geoJSONKindRef, renderLocalGeoJSON]);
+
   // Function to load all saved images as overlays (for display purposes)
   const loadAllSavedImagesAsOverlays = useCallback(() => {
     const map = mapRef.current;
@@ -327,19 +804,19 @@ export default function LeafletViewerComponent() {
         })
       }).addTo(map);
 
-      // Add drag event handlers
-      marker.on('dragstart', () => {
-        resizeStartRef.current = { 
-          bounds: imageOverlayRef.current!.getBounds(), // Use live bounds
-          marker 
-        };
-        marker.getElement()!.style.cursor = 'grabbing';
-        // Disable map dragging while resizing
-        map.dragging.disable();
-      });
+             // Add drag event handlers
+       marker.on('dragstart', () => {
+         resizeStartRef.current = { 
+           bounds: getActiveBounds()!, // Use shared function
+           marker 
+         };
+         marker.getElement()!.style.cursor = 'grabbing';
+         // Disable map dragging while resizing
+         map.dragging.disable();
+       });
 
       marker.on('drag', (e) => {
-        if (!resizeStartRef.current || !imageOverlayRef.current) return;
+        if (!resizeStartRef.current) return;
         
         const currentMarker = e.target;
         const start = resizeStartRef.current.bounds; // Use start bounds here
@@ -414,14 +891,11 @@ export default function LeafletViewerComponent() {
           newBounds = L.latLngBounds(sw, ne);
         }
 
-        // Update image overlay bounds
-        imageOverlayRef.current.setBounds(newBounds);
+        // Update bounds using shared function
+        setActiveBounds(newBounds);
         
         // Re-apply rotation to maintain visual appearance
         applyRotation(rotationDegRef.current);
-        
-        // Update handle positions
-        updateHandlePositions(newBounds);
       });
 
       marker.on('dragend', () => {
@@ -458,7 +932,7 @@ export default function LeafletViewerComponent() {
       // Add drag event handlers for edge handles
       marker.on('dragstart', () => {
         resizeStartRef.current = { 
-          bounds: imageOverlayRef.current!.getBounds(), // Use live bounds
+          bounds: getActiveBounds()!, // Use shared function
           marker 
         };
         marker.getElement()!.style.cursor = 'grabbing';
@@ -467,7 +941,7 @@ export default function LeafletViewerComponent() {
       });
 
       marker.on('drag', (e) => {
-        if (!resizeStartRef.current || !imageOverlayRef.current) return;
+        if (!resizeStartRef.current) return;
         
         const currentMarker = e.target;
         const currentPos = currentMarker.getLatLng();
@@ -504,14 +978,11 @@ export default function LeafletViewerComponent() {
             return;
         }
 
-        // Update image overlay bounds
-        imageOverlayRef.current.setBounds(newBounds);
+        // Update bounds using shared function
+        setActiveBounds(newBounds);
         
         // Re-apply rotation to maintain visual appearance
         applyRotation(rotationDegRef.current);
-        
-        // Update handle positions
-        updateHandlePositions(newBounds);
       });
 
       marker.on('dragend', () => {
@@ -586,14 +1057,14 @@ export default function LeafletViewerComponent() {
       
       // Store the starting positions
       dragStartPos = e.target.getLatLng();
-      dragStartBounds = imageOverlayRef.current?.getBounds() || null;
+      dragStartBounds = getActiveBounds() || null;
       
       // Disable map dragging while moving
       map.dragging.disable();
     });
 
     moveHandle.on('drag', (e) => {
-      if (!imageOverlayRef.current || !dragStartPos || !dragStartBounds) return;
+      if (!dragStartPos || !dragStartBounds) return;
       
       const currentPos = e.target.getLatLng();
       
@@ -609,14 +1080,11 @@ export default function LeafletViewerComponent() {
         [dragStartBounds.getNorth() + offset.lat, dragStartBounds.getEast() + offset.lng]
       );
       
-      // Update image overlay bounds
-      imageOverlayRef.current.setBounds(newBounds);
+      // Update bounds using shared function
+      setActiveBounds(newBounds);
       
       // Re-apply current rotation
       applyRotation(rotationDegRef.current);
-      
-      // Update all handle positions
-      updateHandlePositions(newBounds);
       
       // Keep move handle at the new center position
       const newCenter = newBounds.getCenter();
@@ -665,7 +1133,7 @@ export default function LeafletViewerComponent() {
   }, []);
 
   // Function to update handle positions
-  const updateHandlePositions = (newBounds: L.LatLngBounds) => {
+  const updateHandlePositions = useCallback((newBounds: L.LatLngBounds) => {
     if (handleMarkersRef.current.length === 0) return;
 
     const currentRotation = rotationDegRef.current;
@@ -699,10 +1167,10 @@ export default function LeafletViewerComponent() {
       const p = computeRotateHandleLatLng(newBounds);
       if (p) rotateHandleRef.current.setLatLng(p);
     }
-  };
+  }, []);
 
-  // Helper: apply rotation to the image element
-  const applyRotation = useCallback((deg: number) => {
+  // Helper: apply rotation to the image element (using shared function)
+  const applyRotationToImage = useCallback((deg: number) => {
     const imgEl = imageOverlayRef.current?.getElement() as HTMLImageElement | undefined;
     if (!imgEl) return;
     // Force pivot at center
@@ -2075,25 +2543,71 @@ export default function LeafletViewerComponent() {
               alt="1st Planner Ltd Logo" 
               className="w-12 h-12 object-contain"
             />
-            <h1 className="text-xl font-bold text-blue-700">Image Overlay Tool</h1>
+            <h1 className="text-xl font-bold text-blue-700">Map Workbench</h1>
           </div>
 
-
+          {/* Upload Mode Selector */}
+          <div className="mb-4">
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              📋 What are you uploading?
+            </label>
+            <select
+              value={uploadMode}
+              onChange={(e) => setUploadMode(e.target.value as 'image' | 'geojson')}
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <option value="image">🖼️ Image (PNG/JPG)</option>
+              <option value="geojson">🗺️ GeoJSON (local XY coords)</option>
+            </select>
+          </div>
 
           {/* File Upload */}
           <div className="mb-6">
             <label className="block text-sm font-medium text-gray-700 mb-2">
-              Upload Image
+              {uploadMode === 'image' ? '📁 Upload Image' : '🗺️ Upload GeoJSON'}
             </label>
             <input
               type="file"
-              accept="image/*"
-              onChange={(e) => onFileChosen(e.target.files?.[0] || null)}
+              accept={uploadMode === 'image' ? 'image/*' : '.geojson,.json'}
+              onChange={(e) => {
+                const f = e.target.files?.[0] || null;
+                if (uploadMode === 'image') {
+                  onFileChosen(f);
+                } else {
+                  onGeoJSONChosen(f);
+                }
+              }}
               className="block w-full"
             />
-            {imageFile && (
+            {imageFile && uploadMode === 'image' && (
               <div className="mt-2 p-2 rounded border text-xs text-green-600 border-green-200 bg-green-50">
                 ✅ {imageFile.name} uploaded
+              </div>
+            )}
+            {geoJSONFileRef.current && uploadMode === 'geojson' && (
+              <div className="mt-2 p-2 rounded border text-xs text-green-600 border-green-200 bg-green-50">
+                ✅ {geoJSONFileRef.current.name} uploaded and positioned
+              </div>
+            )}
+            
+            {/* Coordinate System Selector for GeoJSON */}
+            {uploadMode === 'geojson' && (
+              <div className="mt-2">
+                <label className="block text-xs text-gray-600 mb-1">Coordinates</label>
+                <select
+                  defaultValue="auto"
+                  onChange={(e) => { 
+                    const v = e.target.value as 'auto'|'wgs84'|'local';
+                    geoJSONKindRef.current = v === 'auto' ? null : (v as any);
+                    // if a file is already loaded, re-run with the chosen mode
+                    if (geoJSONFileRef.current) onGeoJSONChosen(geoJSONFileRef.current);
+                  }}
+                  className="w-full px-2 py-1 border rounded text-xs"
+                >
+                  <option value="auto">Auto detect</option>
+                  <option value="local">Local XY (pixels/meters)</option>
+                  <option value="wgs84">WGS84 (lon/lat)</option>
+                </select>
               </div>
             )}
           </div>
@@ -2101,35 +2615,35 @@ export default function LeafletViewerComponent() {
           {/* Postcode Input */}
           <div className="mb-6">
             <label className="block text-sm font-medium text-gray-700 mb-2">
-              Center Image at Postcode
+              🎯 Center at Postcode
             </label>
             <div className="flex space-x-2 mb-2">
               <input
                 type="text"
-                placeholder="Enter UK postcode (e.g., SW1A 1AA)"
+                placeholder="SW1A 1AA"
                 className={`flex-1 px-3 py-2 border rounded-md text-sm ${
-                  !imageFile
+                  !imageFile && !geoJSONFileRef.current
                     ? 'border-gray-200 bg-gray-100 text-gray-400 cursor-not-allowed'
                     : 'border-gray-300 bg-white text-gray-900'
                 }`}
-                disabled={!imageFile}
+                disabled={!imageFile && !geoJSONFileRef.current}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter' && imageFile) {
+                  if (e.key === 'Enter' && (imageFile || geoJSONFileRef.current)) {
                     const postcode = (e.currentTarget as HTMLInputElement).value.trim();
-                    if (postcode) centerImageAtPostcode(postcode);
+                    if (postcode) centerAtPostcode(postcode);
                   }
                 }}
               />
               <button
                 onClick={() => {
-                  if (!imageFile) return;
-                  const postcodeInput = document.querySelector('input[placeholder*="postcode"]') as HTMLInputElement;
+                  if (!imageFile && !geoJSONFileRef.current) return;
+                  const postcodeInput = document.querySelector('input[placeholder="SW1A 1AA"]') as HTMLInputElement;
                   const postcode = postcodeInput?.value.trim();
-                  if (postcode) centerImageAtPostcode(postcode);
+                  if (postcode) centerAtPostcode(postcode);
                 }}
-                disabled={!imageFile}
+                disabled={!imageFile && !geoJSONFileRef.current}
                 className={`px-4 py-2 text-sm rounded-md transition-colors ${
-                  !imageFile
+                  !imageFile && !geoJSONFileRef.current
                     ? 'bg-gray-400 text-gray-200 cursor-not-allowed'
                     : 'bg-blue-600 text-white hover:bg-blue-700'
                 }`}
@@ -2137,24 +2651,18 @@ export default function LeafletViewerComponent() {
                 Center
               </button>
             </div>
+            {!imageFile && !geoJSONFileRef.current ? (
+              <p className="text-xs text-gray-400">Upload an image or GeoJSON file first</p>
+            ) : (
+              <p className="text-xs text-green-600">✅ Ready to center at postcode</p>
+            )}
 
-            <p className="text-xs text-gray-500 mt-1">
-              {!imageFile 
-                ? 'Upload an image first to enable postcode centering'
-                : 'Enter a UK postcode and press Enter or click Center to position the image'
-              }
-            </p>
-            <div className="mt-2 text-xs text-gray-400">
-              <p className="font-medium">Example postcodes:</p>
-              <p>SW1A 1AA (Buckingham Palace)</p>
-              <p>M1 1AA (Manchester), B1 1AA (Birmingham)</p>
-            </div>
-
-            {/* Resize Controls */}
+            {/* Image Controls */}
             {imageFile && (
-              <div className="mt-4 pt-4 border-t">
-                <div className="flex items-center justify-between mb-2">
-                  <label className="text-sm font-medium text-gray-700">Image Resizing</label>
+              <div className="space-y-4">
+                {/* Resize Controls */}
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium text-gray-700">🔄 Resize</span>
                   <button
                     onClick={() => setShowResizeHandles(!showResizeHandles)}
                     className={`px-3 py-1 text-xs rounded-md ${
@@ -2163,56 +2671,19 @@ export default function LeafletViewerComponent() {
                         : 'bg-gray-300 text-gray-700 hover:bg-gray-400'
                     }`}
                   >
-                    {showResizeHandles ? 'Hide Handles' : 'Show Handles'}
+                    {showResizeHandles ? 'Hide' : 'Show'}
                   </button>
                 </div>
-                <p className="text-xs text-gray-500">
-                  {showResizeHandles 
-                    ? '🟡 Drag yellow corners for uniform scaling'
-                    : 'Click "Show Handles" to enable image resizing'
-                  }
-                  {showResizeHandles && (
-                    <span className="block mt-1">🟠 Drag orange edges for non-uniform scaling</span>
-                  )}
-                </p>
-                {showResizeHandles && (
-                  <div className="mt-2 p-2 bg-blue-50 rounded border border-blue-200">
-                    <p className="text-xs text-blue-700">
-                      <strong>Tip:</strong> Drag the handles to resize your image. 
-                      Yellow corners maintain aspect ratio, orange edges allow free resizing.
-                    </p>
-                  </div>
-                )}
-              </div>
-            )}
 
-            {/* Move Controls */}
-            {imageFile && (
-              <div className="mt-4 pt-4 border-t">
-                <div className="mb-2">
-                  <label className="text-sm font-medium text-gray-700">Image Moving</label>
+                {/* Move Controls */}
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium text-gray-700">🚀 Move</span>
+                  <span className="text-xs text-gray-500">Ctrl + Drag</span>
                 </div>
-                <p className="text-xs text-gray-500">
-                  Hold Ctrl and drag anywhere on the image to move it
-                </p>
-                  <div className="mt-2 p-2 bg-green-50 rounded border border-green-200">
-                    <p className="text-xs text-green-700">
-                    <strong>Tip:</strong> Hold the Ctrl key and drag anywhere on the image to smoothly move it around the map.
-                    </p>
-                    <div className="mt-2 pt-2 border-t border-green-200">
-                      <p className="text-xs text-green-600 font-medium">Precision Controls:</p>
-                    <p className="text-xs text-green-600">• Ctrl + Drag: Fine-tuned movement from anywhere on image</p>
-                      <p className="text-xs text-green-600">• Arrow keys: Pixel-perfect positioning</p>
-                    </div>
-                  </div>
-              </div>
-            )}
 
-            {/* Rotation Controls */}
-            {imageFile && (
-              <div className="mt-4 pt-4 border-t">
-                <div className="flex items-center justify-between mb-2">
-                  <label className="text-sm font-medium text-gray-700">Image Rotation</label>
+                {/* Rotation Controls */}
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium text-gray-700">🔄 Rotate</span>
                   <div className="flex space-x-2">
                     <button
                       onClick={() => setShowRotateHandle(!showRotateHandle)}
@@ -2222,7 +2693,7 @@ export default function LeafletViewerComponent() {
                           : 'bg-gray-300 text-gray-700 hover:bg-gray-400'
                       }`}
                     >
-                      {showRotateHandle ? 'Hide Rotate' : 'Show Rotate'}
+                      {showRotateHandle ? 'Hide' : 'Show'}
                     </button>
                     <button
                       onClick={() => { rotationDegRef.current = 0; applyRotation(0); if (imageOverlayRef.current && rotateHandleRef.current) { const b = imageOverlayRef.current.getBounds(); const p = computeRotateHandleLatLng(b); if (p) rotateHandleRef.current.setLatLng(p); } }}
@@ -2233,28 +2704,80 @@ export default function LeafletViewerComponent() {
                     </button>
                   </div>
                 </div>
-                <p className="text-xs text-gray-500">
-                  {showRotateHandle 
-                    ? '🟢 Drag the green handle to rotate the image around its center'
-                    : 'Click "Show Rotate" to enable image rotation'
-                  }
-                </p>
-              </div>
-            )}
 
-            {/* Save Image Button */}
-            {imageFile && (
-              <div className="mt-4 pt-4 border-t">
+                {/* Save Button */}
                 <button
                   onClick={openSaveDialog}
-                  className="w-full px-4 py-2 text-sm transition-colors bg-green-600 text-white hover:bg-green-700"
+                  className="w-full px-4 py-2 text-sm transition-colors bg-green-600 text-white hover:bg-green-700 rounded-md"
                 >
                   {activeImageId ? '💾 Update Saved Image' : '💾 Save Image Position'}
                 </button>
-                
-                <p className="text-xs text-gray-500 mt-2">
-                  Save the current image position, rotation, and transparency with a custom name and floor level
-                </p>
+              </div>
+            )}
+
+            {/* GeoJSON Controls */}
+            {geoJSONFileRef.current && uploadMode === 'geojson' && (
+              <div className="space-y-4">
+                {/* Resize Controls */}
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium text-gray-700">🔄 Resize</span>
+                  <button
+                    onClick={() => setShowResizeHandles(!showResizeHandles)}
+                    className={`px-3 py-1 text-xs rounded-md ${
+                      showResizeHandles 
+                        ? 'bg-blue-600 text-white hover:bg-blue-700' 
+                        : 'bg-gray-300 text-gray-700 hover:bg-gray-400'
+                    }`}
+                  >
+                    {showResizeHandles ? 'Hide' : 'Show'}
+                  </button>
+                </div>
+
+                {/* Move Controls */}
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium text-gray-700">🚀 Move</span>
+                  <span className="text-xs text-gray-500">Ctrl + Drag</span>
+                </div>
+
+                {/* Rotation Controls */}
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium text-gray-700">🔄 Rotate</span>
+                  <div className="flex space-x-2">
+                    <button
+                      onClick={() => setShowRotateHandle(!showRotateHandle)}
+                      className={`px-3 py-1 text-xs rounded-md ${
+                        showRotateHandle 
+                          ? 'bg-emerald-600 text-white hover:bg-emerald-700' 
+                          : 'bg-gray-300 text-gray-700 hover:bg-gray-400'
+                      }`}
+                    >
+                      {showRotateHandle ? 'Hide' : 'Show'}
+                    </button>
+                    <button
+                      onClick={() => { 
+                        rotationDegRef.current = 0; 
+                        applyRotation(0); 
+                        if (activeBoundsRef.current && rotateHandleRef.current) { 
+                          const b = activeBoundsRef.current; 
+                          const p = computeRotateHandleLatLng(b); 
+                          if (p) rotateHandleRef.current.setLatLng(p); 
+                        } 
+                      }}
+                      className="px-3 py-1 text-xs rounded-md bg-red-500 text-white hover:bg-red-600"
+                      title="Reset rotation to 0°"
+                    >
+                      Reset
+                    </button>
+                  </div>
+                </div>
+
+                {/* Save Button */}
+                <button
+                  onClick={openSaveDialog}
+                  className="w-full px-4 py-2 text-sm transition-colors bg-green-600 text-white hover:bg-green-700 rounded-md"
+                >
+                  {activeImageId ? '💾 Update Saved GeoJSON' : '💾 Save GeoJSON Position'}
+                </button>
               </div>
             )}
 
@@ -2263,21 +2786,21 @@ export default function LeafletViewerComponent() {
               <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[10000]">
                 <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
                   <h3 className="text-lg font-semibold text-gray-800 mb-4">
-                    {activeImageId ? 'Update Saved Image' : 'Save Image'}
+                    {activeImageId ? `Update Saved ${uploadMode === 'image' ? 'Image' : 'GeoJSON'}` : `Save ${uploadMode === 'image' ? 'Image' : 'GeoJSON'}`}
                   </h3>
                   
                   <div className="space-y-4">
-                    {/* Image Name Input */}
+                    {/* Name Input */}
                     <div>
                       <label className="block text-sm font-medium text-gray-700 mb-2">
-                        Image Name
+                        {uploadMode === 'image' ? 'Image' : 'GeoJSON'} Name
                       </label>
                       <input
                         type="text"
                         value={imageName}
                         onChange={(e) => setImageName(e.target.value)}
                         className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                        placeholder="Enter image name"
+                        placeholder={`Enter ${uploadMode === 'image' ? 'image' : 'GeoJSON'} name`}
                       />
                     </div>
 
@@ -2312,7 +2835,14 @@ export default function LeafletViewerComponent() {
                       Cancel
                     </button>
                     <button
-                      onClick={saveCurrentImage}
+                      onClick={() => {
+                        if (uploadMode === 'image') {
+                          saveCurrentImage();
+                        } else {
+                          // Will implement GeoJSON save later
+                          alert('GeoJSON save functionality coming soon!');
+                        }
+                      }}
                       disabled={!imageName.trim()}
                       className="flex-1 px-4 py-2 text-sm bg-green-600 text-white rounded-md hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
                     >
@@ -2323,17 +2853,21 @@ export default function LeafletViewerComponent() {
               </div>
             )}
 
-            {/* Instructions */}
+            {/* Quick Guide */}
             <div className="mt-6 pt-4 border-t">
-              <h4 className="text-sm font-medium text-gray-700 mb-2">How to Use</h4>
-              <div className="text-xs text-gray-600 space-y-2">
-                <p>1. <strong>Upload:</strong> Select an image file</p>
-                <p>2. <strong>Position:</strong> Use Ctrl+drag to move the image</p>
-                <p>3. <strong>Resize:</strong> Show handles and drag corners/edges</p>
-                <p>4. <strong>Rotate:</strong> Show rotate handle and drag to rotate</p>
-                <p>5. <strong>Save:</strong> Click "Save Image Position" to name and categorize</p>
-                <p>6. <strong>Load:</strong> Click saved images in right sidebar</p>
-                <p>7. <strong>Draw:</strong> Use polygon tools to annotate saved images</p>
+              <h4 className="text-sm font-medium text-gray-700 mb-3">📖 Quick Guide</h4>
+              <div className="text-xs text-gray-600 space-y-1">
+                <p>• Upload {uploadMode === 'image' ? 'image' : 'GeoJSON'} → Position with Ctrl+drag</p>
+                <p>• Show resize handles → Drag corners/edges</p>
+                <p>• Show rotate handle → Drag to rotate</p>
+                <p>• Save position → Name & categorize</p>
+                <p>• Right sidebar → Load saved {uploadMode === 'image' ? 'images' : 'files'}</p>
+                {uploadMode === 'geojson' && (
+                  <>
+                    <p>• Local XY coordinates → Automatically detected</p>
+                    <p>• WGS84 coordinates → Displayed directly</p>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -2450,20 +2984,7 @@ export default function LeafletViewerComponent() {
                   )}
                 </div>
               
-              {/* Debug button for area calculation */}
-              {drawnPolygons.length > 0 && (
-                <button
-                  onClick={() => {
-                    console.log('Current drawnPolygons:', drawnPolygons);
-                    console.log('Current polygonAreas:', polygonAreas);
-                    updatePolygonAreas();
-                  }}
-                  className="w-full px-2 py-1 text-xs bg-gray-500 text-white rounded hover:bg-gray-600 transition-colors mt-2"
-                  title="Debug area calculation"
-                >
-                  🐛 Debug Areas
-                </button>
-              )}
+
             </div>
           )}
 
