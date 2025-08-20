@@ -39,7 +39,12 @@ export default function LeafletViewerComponent() {
     transparency: number;
     floorLevel: string;
     timestamp: number;
-    polygons?: Array<{ latlngs: Array<{ lat: number; lng: number }> }>;
+    polygons?: Array<{ 
+      latlngs: Array<{ lat: number; lng: number }>;
+      name?: string;
+      area?: number;
+      unit?: string;
+    }>;
   }>>([]);
   const [activeImageId, setActiveImageId] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
@@ -52,6 +57,13 @@ export default function LeafletViewerComponent() {
   const [showPolygonTools, setShowPolygonTools] = useState(false);
   const [isDrawingPolygon, setIsDrawingPolygon] = useState(false);
   const [drawnPolygons, setDrawnPolygons] = useState<L.Polygon[]>([]);
+  const [polygonAreas, setPolygonAreas] = useState<Array<{ id: string; name: string; area: number; unit: string }>>([]);
+  const [showPolygonNameDialog, setShowPolygonNameDialog] = useState(false);
+  const [polygonName, setPolygonName] = useState('');
+  const [polygonToName, setPolygonToName] = useState<{ polygon: L.Polygon; area: number; unit: string } | null>(null);
+  const [showContextMenu, setShowContextMenu] = useState(false);
+  const [contextMenuPosition, setContextMenuPosition] = useState({ x: 0, y: 0 });
+  const [contextMenuPolygon, setContextMenuPolygon] = useState<{ polygon: L.Polygon; index: number; name: string; polygonId: string } | null>(null);
 
   // Function to load all saved images as overlays (for display purposes)
   const loadAllSavedImagesAsOverlays = useCallback(() => {
@@ -1362,6 +1374,45 @@ export default function LeafletViewerComponent() {
         finalPolygon.addTo(map);
         setDrawnPolygons(prev => [...prev, finalPolygon]);
         
+        // Add hover tooltip to the polygon
+        const areaData = calculatePolygonArea(finalPolygon);
+        finalPolygon.bindTooltip(
+          `Area: ${areaData.area} ${areaData.unit}`,
+          { 
+            permanent: false, 
+            direction: 'top',
+            className: 'polygon-tooltip',
+            offset: [0, -10]
+          }
+        );
+        
+        // Add right-click context menu for polygon deletion
+        finalPolygon.on('contextmenu', (e) => {
+          const polygonIndex = drawnPolygons.length; // This will be the new polygon's index
+          const polygonName = `Polygon ${polygonIndex + 1}`;
+          showPolygonContextMenu(e.originalEvent, finalPolygon, polygonIndex, polygonName, 'temp');
+        });
+        
+        // Add visual feedback for right-click interaction
+        finalPolygon.on('mouseover', () => {
+          const element = finalPolygon.getElement();
+          if (element && element instanceof HTMLElement) {
+            element.style.cursor = 'pointer';
+          }
+        });
+        
+        finalPolygon.on('mouseout', () => {
+          const element = finalPolygon.getElement();
+          if (element && element instanceof HTMLElement) {
+            element.style.cursor = 'default';
+          }
+        });
+        
+        // Show polygon naming dialog
+        setPolygonToName({ polygon: finalPolygon, area: areaData.area, unit: areaData.unit });
+        setPolygonName('');
+        setShowPolygonNameDialog(true);
+        
         // Clean up
         map.off('click', onMapClick);
         map.off('dblclick', onDoubleClick);
@@ -1371,9 +1422,6 @@ export default function LeafletViewerComponent() {
         // Reset map cursor
         const mapContainer = map.getContainer();
         mapContainer.style.cursor = '';
-        
-        // Show instructions
-        alert('Polygon drawn! Double-click to finish drawing.');
       } else {
         alert('Polygon needs at least 3 points. Keep clicking to add more points.');
       }
@@ -1394,6 +1442,8 @@ export default function LeafletViewerComponent() {
       map.removeLayer(polygon);
     });
     setDrawnPolygons([]);
+    setPolygonAreas([]);
+    console.log('Cleared all polygons and areas');
   }, [drawnPolygons]);
 
   const cancelPolygonDrawing = useCallback(() => {
@@ -1421,6 +1471,92 @@ export default function LeafletViewerComponent() {
     }
   }, [isDrawingPolygon, drawnPolygons]);
 
+  // Function to calculate polygon area
+  const calculatePolygonArea = useCallback((polygon: L.Polygon) => {
+    const map = mapRef.current;
+    if (!map) return { area: 0, unit: 'm²' };
+
+    try {
+      // Get the polygon latlngs
+      const latlngs = polygon.getLatLngs()[0] as L.LatLng[];
+      if (!Array.isArray(latlngs) || latlngs.length < 3) {
+        return { area: 0, unit: 'm²' };
+      }
+
+      // Calculate area using the shoelace formula (planar approximation)
+      let area = 0;
+      for (let i = 0; i < latlngs.length; i++) {
+        const j = (i + 1) % latlngs.length;
+        area += latlngs[i].lng * latlngs[j].lat;
+        area -= latlngs[j].lng * latlngs[i].lat;
+      }
+      area = Math.abs(area) / 2;
+
+      // Convert to square meters (approximate conversion)
+      // This is a rough approximation - for more accurate results, 
+      // you'd need to account for the actual geographic projection
+      const metersPerDegree = 111320; // Approximate meters per degree at equator
+      const areaInSquareMeters = area * (metersPerDegree * metersPerDegree);
+
+      // Convert to appropriate units
+      let displayArea: number;
+      let unit: string;
+      
+      if (areaInSquareMeters < 10000) {
+        // Less than 10,000 m² - show in m²
+        displayArea = Math.round(areaInSquareMeters);
+        unit = 'm²';
+      } else if (areaInSquareMeters < 10000000) {
+        // Less than 10,000,000 m² - show in hectares
+        displayArea = Math.round(areaInSquareMeters / 10000 * 100) / 100;
+        unit = 'ha';
+      } else {
+        // Large areas - show in km²
+        displayArea = Math.round(areaInSquareMeters / 1000000 * 100) / 100;
+        unit = 'km²';
+      }
+      
+      console.log('Calculated area:', { area, areaInSquareMeters, displayArea, unit });
+      return { area: displayArea, unit };
+    } catch (error) {
+      console.error('Error calculating polygon area:', error);
+      return { area: 0, unit: 'm²' };
+    }
+  }, []);
+
+  // Function to update polygon areas
+  const updatePolygonAreas = useCallback(() => {
+    if (drawnPolygons.length === 0) {
+      setPolygonAreas([]);
+      return;
+    }
+    
+    const newAreas = drawnPolygons.map((polygon, index) => {
+      const areaData = calculatePolygonArea(polygon);
+      
+      // Try to preserve existing custom names from polygonAreas
+      const existingArea = polygonAreas[index];
+      const name = existingArea?.name || `Polygon ${index + 1}`;
+      
+      return {
+        id: `polygon_${index}`,
+        name: name,
+        area: areaData.area,
+        unit: areaData.unit
+      };
+    });
+    
+    setPolygonAreas(newAreas);
+  }, [drawnPolygons, calculatePolygonArea, polygonAreas]);
+
+  // Auto-update polygon areas when drawnPolygons changes
+  useEffect(() => {
+    if (drawnPolygons.length > 0) {
+      console.log('Auto-updating polygon areas due to drawnPolygons change');
+      updatePolygonAreas();
+    }
+  }, [drawnPolygons.length]); // Only depend on the length, not the function
+
   const deleteLastPolygon = useCallback(() => {
     if (drawnPolygons.length === 0) return;
     
@@ -1430,16 +1566,99 @@ export default function LeafletViewerComponent() {
     const lastPolygon = drawnPolygons[drawnPolygons.length - 1];
     map.removeLayer(lastPolygon);
     setDrawnPolygons(prev => prev.slice(0, -1));
+    
+    // Update polygon areas after deletion
+    updatePolygonAreas();
   }, [drawnPolygons]);
 
+  // Function to delete a specific polygon by index
+  const deletePolygonAtIndex = useCallback((index: number) => {
+    if (index < 0 || index >= drawnPolygons.length) return;
+    
+    const map = mapRef.current;
+    if (!map) return;
+
+    const polygonToDelete = drawnPolygons[index];
+    if (!polygonToDelete) return; // Safety check
+    
+    // Remove from map
+    map.removeLayer(polygonToDelete);
+    
+    // Remove from drawnPolygons array and update areas in one go
+    setDrawnPolygons(prev => {
+      const newPolygons = prev.filter((_, i) => i !== index);
+      
+      // Update polygon areas immediately based on new array
+      if (newPolygons.length === 0) {
+        setPolygonAreas([]);
+      } else {
+        // Calculate new areas for remaining polygons
+        const newAreas = newPolygons.map((polygon, newIndex) => {
+          const areaData = calculatePolygonArea(polygon);
+          
+          // Try to preserve existing custom names, adjusting for the new index
+          const oldIndex = drawnPolygons.findIndex(p => p === polygon);
+          const existingArea = oldIndex >= 0 ? polygonAreas[oldIndex] : null;
+          const name = existingArea?.name || `Polygon ${newIndex + 1}`;
+          
+          return {
+            id: `polygon_${newIndex}`,
+            name: name,
+            area: areaData.area,
+            unit: areaData.unit
+          };
+        });
+        setPolygonAreas(newAreas);
+      }
+      
+      return newPolygons;
+    });
+    
+    // Close context menu
+    setShowContextMenu(false);
+    setContextMenuPolygon(null);
+  }, [drawnPolygons, calculatePolygonArea, polygonAreas]);
+
+  // Function to show context menu for polygon deletion
+  const showPolygonContextMenu = useCallback((e: MouseEvent, polygon: L.Polygon, index: number, name: string, polygonId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    
+    setContextMenuPosition({ x: e.clientX, y: e.clientY });
+    setContextMenuPolygon({ polygon, index, name, polygonId });
+    setShowContextMenu(true);
+  }, []);
+
+  // Function to close context menu
+  const closeContextMenu = useCallback(() => {
+    setShowContextMenu(false);
+    setContextMenuPolygon(null);
+  }, []);
+
+
+
+  // Close context menu when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (showContextMenu) {
+        closeContextMenu();
+      }
+    };
+    
+    if (showContextMenu) {
+      document.addEventListener('click', handleClickOutside);
+      return () => document.removeEventListener('click', handleClickOutside);
+    }
+  }, [showContextMenu, closeContextMenu]);
+
   const savePolygonsToImage = useCallback(() => {
-    if (!activeImageId || drawnPolygons.length === 0) return;
+    if (!activeImageId) return;
     
     const imageIndex = savedImages.findIndex(img => img.id === activeImageId);
     if (imageIndex === -1) return;
     
-    // Convert polygons to serializable format
-    const serializablePolygons = drawnPolygons.map(polygon => {
+    // Convert polygons to serializable format with areas (or empty array if no polygons)
+    const serializablePolygons = drawnPolygons.length > 0 ? drawnPolygons.map((polygon, index) => {
       const latlngs = polygon.getLatLngs();
       // Handle different polygon types (simple polygon vs multi-polygon)
       if (Array.isArray(latlngs) && latlngs.length > 0) {
@@ -1448,13 +1667,16 @@ export default function LeafletViewerComponent() {
           latlngs: firstRing.map((latlng: any) => ({
             lat: latlng.lat,
             lng: latlng.lng
-          }))
+          })),
+          name: polygonAreas[index]?.name || `Polygon ${index + 1}`,
+          area: polygonAreas[index]?.area || 0,
+          unit: polygonAreas[index]?.unit || 'm²'
         };
       }
-      return { latlngs: [] };
-    });
+      return { latlngs: [], name: `Polygon ${index + 1}`, area: 0, unit: 'm²' };
+    }) : [];
     
-    // Update the saved image with polygons
+    // Update the saved image with polygons (or empty array)
     setSavedImages(prev => {
       const newSavedImages = [...prev];
       newSavedImages[imageIndex] = {
@@ -1464,8 +1686,13 @@ export default function LeafletViewerComponent() {
       return newSavedImages;
     });
     
-    alert(`Saved ${drawnPolygons.length} polygon${drawnPolygons.length !== 1 ? 's' : ''} to "${savedImages[imageIndex].name}"`);
-  }, [activeImageId, drawnPolygons, savedImages]);
+    // Show appropriate message based on polygon count
+    if (drawnPolygons.length === 0) {
+      alert(`Saved image "${savedImages[imageIndex].name}" with no polygons`);
+    } else {
+      alert(`Saved ${drawnPolygons.length} polygon${drawnPolygons.length !== 1 ? 's' : ''} to "${savedImages[imageIndex].name}"`);
+    }
+  }, [activeImageId, drawnPolygons, savedImages, polygonAreas]);
 
   // Function to load saved image - using same logic as showImage
   const loadSavedImage = useCallback((savedImage: typeof savedImages[0]) => {
@@ -1527,33 +1754,109 @@ export default function LeafletViewerComponent() {
     // Show polygon tools when viewing saved images
     setShowPolygonTools(true);
     
-    // Restore saved polygons if they exist
-    if (savedImage.polygons && savedImage.polygons.length > 0) {
-      // Clear any existing polygons first
-      clearAllPolygons();
-      
-      // Restore saved polygons
-      const restoredPolygons: L.Polygon[] = [];
-      savedImage.polygons.forEach(polyData => {
-        if (polyData.latlngs && polyData.latlngs.length >= 3) {
-          const polygon = L.polygon(polyData.latlngs, {
-            color: '#ff4444',
-            weight: 3,
-            opacity: 0.8,
-            fillColor: '#ff4444',
-            fillOpacity: 0.3
-          });
-          polygon.addTo(map);
-          restoredPolygons.push(polygon);
+                  // Restore saved polygons if they exist
+        if (savedImage.polygons && savedImage.polygons.length > 0) {
+          // Clear any existing polygons first
+          clearAllPolygons();
+          
+          // Restore saved polygons
+          const restoredPolygons: L.Polygon[] = [];
+          const restoredAreas: Array<{ id: string; name: string; area: number; unit: string }> = [];
+        
+        savedImage.polygons.forEach((polyData, index) => {
+          if (polyData.latlngs && polyData.latlngs.length >= 3) {
+            const polygon = L.polygon(polyData.latlngs, {
+              color: '#ff4444',
+              weight: 3,
+              opacity: 0.8,
+              fillColor: '#ff4444',
+              fillOpacity: 0.3
+            });
+            
+            polygon.addTo(map);
+            restoredPolygons.push(polygon);
+            
+            // Add right-click context menu for polygon deletion
+            polygon.on('contextmenu', (e) => {
+              const polygonName = polyData.name || `Polygon ${index + 1}`;
+              showPolygonContextMenu(e.originalEvent, polygon, index, polygonName, 'saved');
+            });
+            
+            // Add visual feedback for right-click interaction
+            polygon.on('mouseover', () => {
+              const element = polygon.getElement();
+              if (element && element instanceof HTMLElement) {
+                element.style.cursor = 'pointer';
+              }
+            });
+            
+            polygon.on('mouseout', () => {
+              const element = polygon.getElement();
+              if (element && element instanceof HTMLElement) {
+                element.style.cursor = 'default';
+              }
+            });
+            
+            // Add tooltip to restored polygon
+            if (polyData.area && polyData.unit) {
+              const polygonName = polyData.name || `Polygon ${index + 1}`;
+              polygon.bindTooltip(
+                `${polygonName}<br>Area: ${polyData.area} ${polyData.unit}`,
+                { 
+                  permanent: false, 
+                  direction: 'top',
+                  className: 'polygon-tooltip',
+                  offset: [0, -10]
+                }
+              );
+              
+              restoredAreas.push({
+                id: `polygon_${index}`,
+                name: polygonName,
+                area: polyData.area,
+                unit: polyData.unit
+              });
+            } else {
+              // Calculate area for polygon without saved data
+              const areaData = calculatePolygonArea(polygon);
+              const polygonName = polyData.name || `Polygon ${index + 1}`;
+              polygon.bindTooltip(
+                `${polygonName}<br>Area: ${areaData.area} ${areaData.unit}`,
+                { 
+                  permanent: false, 
+                  direction: 'top',
+                  className: 'polygon-tooltip',
+                  offset: [0, -10]
+                }
+              );
+              
+              restoredAreas.push({
+                id: `polygon_${index}`,
+                name: polygonName,
+                area: areaData.area,
+                unit: areaData.unit
+              });
+            }
+          }
+        });
+        
+        setDrawnPolygons(restoredPolygons);
+        
+        // If we have saved areas, use them; otherwise calculate new ones
+        if (restoredAreas.length > 0) {
+          setPolygonAreas(restoredAreas);
+        } else {
+          // Calculate areas for restored polygons
+          setTimeout(() => {
+            updatePolygonAreas();
+          }, 100);
         }
-      });
-      
-      setDrawnPolygons(restoredPolygons);
-      console.log(`Restored ${restoredPolygons.length} polygons for ${savedImage.name}`);
-    } else {
-      // Clear any existing polygons
-      clearAllPolygons();
-    }
+        
+        console.log(`Restored ${restoredPolygons.length} polygons for ${savedImage.name}`);
+      } else {
+        // Clear any existing polygons
+        clearAllPolygons();
+      }
 
     console.log(`Loaded saved image: ${savedImage.name} - Ready for editing!`);
 
@@ -2059,22 +2362,46 @@ export default function LeafletViewerComponent() {
                 
                 <button
                   onClick={savePolygonsToImage}
-                  disabled={drawnPolygons.length === 0 || !activeImageId}
+                  disabled={!activeImageId}
                   className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
-                    drawnPolygons.length === 0 || !activeImageId
+                    !activeImageId
                       ? 'bg-gray-400 text-gray-200 cursor-not-allowed'
                       : 'bg-green-600 text-white hover:bg-green-700'
                   }`}
-                  title="Save Polygons to Image"
+                  title="Save Polygons to Image (or save with no polygons)"
                 >
                   💾
                 </button>
               </div>
               
-              {drawnPolygons.length > 0 && (
-                <div className="text-xs text-gray-600 text-center mt-1 pt-1 border-t">
-                  {drawnPolygons.length} polygon{drawnPolygons.length !== 1 ? 's' : ''}
+                              <div className="text-xs text-gray-600 text-center mt-1 pt-1 border-t">
+                  {drawnPolygons.length > 0 ? (
+                    <>
+                      {drawnPolygons.length} polygon{drawnPolygons.length !== 1 ? 's' : ''}
+                      <div className="text-xs text-blue-500 mt-1">
+                        💡 Right-click any polygon to delete it
+                      </div>
+                    </>
+                  ) : (
+                    <div className="text-xs text-green-600 mt-1">
+                      💾 Save button will save image without polygons
+                    </div>
+                  )}
                 </div>
+              
+              {/* Debug button for area calculation */}
+              {drawnPolygons.length > 0 && (
+                <button
+                  onClick={() => {
+                    console.log('Current drawnPolygons:', drawnPolygons);
+                    console.log('Current polygonAreas:', polygonAreas);
+                    updatePolygonAreas();
+                  }}
+                  className="w-full px-2 py-1 text-xs bg-gray-500 text-white rounded hover:bg-gray-600 transition-colors mt-2"
+                  title="Debug area calculation"
+                >
+                  🐛 Debug Areas
+                </button>
               )}
             </div>
           )}
@@ -2199,6 +2526,12 @@ export default function LeafletViewerComponent() {
                       <span>Opacity:</span>
                       <span className="font-medium">{Math.round(savedImage.transparency * 100)}%</span>
                     </div>
+                    {savedImage.polygons && savedImage.polygons.length > 0 && (
+                      <div className="flex justify-between">
+                        <span>Polygons:</span>
+                        <span className="font-medium">{savedImage.polygons.length}</span>
+                      </div>
+                    )}
                   </div>
 
                   {activeImageId === savedImage.id && (
@@ -2210,8 +2543,204 @@ export default function LeafletViewerComponent() {
               ))}
             </div>
           )}
+
+          {/* Current Polygon Areas - Show when viewing saved images */}
+          {showPolygonTools && (
+            <div className="mt-6 pt-4 border-t border-gray-200">
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="text-sm font-medium text-gray-700">Current Polygon Areas</h4>
+                <button
+                  onClick={updatePolygonAreas}
+                  className="px-2 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                  title="Refresh polygon areas"
+                >
+                  🔄
+                </button>
+              </div>
+              
+
+              
+              {drawnPolygons.length > 0 ? (
+                <div className="space-y-2">
+                  {polygonAreas.length > 0 ? (
+                    <>
+                      {polygonAreas.map((areaData, index) => (
+                        <div key={areaData.id} className="flex items-center justify-between p-2 bg-blue-50 rounded border border-blue-200">
+                          <div className="flex items-center space-x-2">
+                            <div className="w-3 h-3 bg-red-500 rounded-full"></div>
+                            <span className="text-xs text-gray-600">{areaData.name || `Polygon ${index + 1}`}</span>
+                          </div>
+                          <span className="text-sm font-medium text-blue-700">
+                            {areaData.area} {areaData.unit}
+                          </span>
+                        </div>
+                      ))}
+                      <div className="text-xs text-gray-500 text-center pt-2">
+                        Total Area: {polygonAreas.reduce((sum, area) => sum + area.area, 0)} {polygonAreas[0]?.unit || 'm²'}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="text-center py-4 text-gray-500 text-sm">
+                      No area data available. Click refresh to calculate.
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="text-center py-4 text-gray-500 text-sm">
+                  No polygons currently drawn. Load a saved image or draw new polygons.
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
-    </div>
+       {/* Polygon Naming Dialog */}
+    {showPolygonNameDialog && polygonToName && (
+      <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[10000]">
+        <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+          <h3 className="text-lg font-semibold text-gray-800 mb-4">
+            Name Your Polygon
+          </h3>
+          
+          <div className="space-y-4">
+            {/* Area Display */}
+            <div className="p-3 bg-blue-50 rounded border border-blue-200">
+              <p className="text-sm text-blue-700">
+                <strong>Area:</strong> {polygonToName?.area} {polygonToName?.unit}
+              </p>
+            </div>
+
+            {/* Polygon Name Input */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Polygon Name
+              </label>
+              <input
+                type="text"
+                value={polygonName}
+                onChange={(e) => setPolygonName(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                placeholder="Enter a name for this polygon"
+                autoFocus
+              />
+            </div>
+          </div>
+
+          <div className="flex space-x-3 mt-6">
+            <button
+              onClick={() => {
+                setShowPolygonNameDialog(false);
+                setPolygonToName(null);
+                setPolygonName('');
+              }}
+              className="flex-1 px-4 py-2 text-sm border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => {
+                if (polygonName.trim()) {
+                  // Update the polygon with the name and calculate areas
+                  const finalName = polygonName.trim();
+                  const polygonIndex = drawnPolygons.length - 1;
+                  
+                  // Update polygon areas with the name
+                  setPolygonAreas(prev => {
+                    const newAreas = [...prev];
+                    if (newAreas[polygonIndex]) {
+                      newAreas[polygonIndex] = {
+                        ...newAreas[polygonIndex],
+                        name: finalName
+                      };
+                    } else {
+                      // If this polygon doesn't have an area entry yet, create one
+                      newAreas[polygonIndex] = {
+                        id: `polygon_${polygonIndex}`,
+                        name: finalName,
+                        area: polygonToName?.area || 0,
+                        unit: polygonToName?.unit || 'm²'
+                      };
+                    }
+                    return newAreas;
+                  });
+                  
+                  // Update tooltip to include name
+                  if (polygonToName) {
+                    polygonToName.polygon.bindTooltip(
+                      `${finalName}<br>Area: ${polygonToName.area} ${polygonToName.unit}`,
+                      { 
+                        permanent: false, 
+                        direction: 'top',
+                        className: 'polygon-tooltip',
+                        offset: [0, -10]
+                      }
+                    );
+                  }
+                  
+                  // Add right-click context menu for the named polygon
+                  const namedPolygonIndex = drawnPolygons.findIndex(p => p === polygonToName.polygon);
+                  if (namedPolygonIndex !== -1) {
+                    polygonToName.polygon.off('contextmenu'); // Remove any existing handler
+                    polygonToName.polygon.on('contextmenu', (e) => {
+                      showPolygonContextMenu(e.originalEvent, polygonToName.polygon, namedPolygonIndex, finalName, 'named');
+                    });
+                    
+                    // Add visual feedback for right-click interaction
+                    polygonToName.polygon.off('mouseover mouseout'); // Remove any existing handlers
+                    polygonToName.polygon.on('mouseover', () => {
+                      const element = polygonToName.polygon.getElement();
+                      if (element && element instanceof HTMLElement) {
+                        element.style.cursor = 'pointer';
+                      }
+                    });
+                    
+                    polygonToName.polygon.on('mouseout', () => {
+                      const element = polygonToName.polygon.getElement();
+                      if (element && element instanceof HTMLElement) {
+                        element.style.cursor = 'default';
+                      }
+                    });
+                  }
+                  
+                  setShowPolygonNameDialog(false);
+                  setPolygonToName(null);
+                  setPolygonName('');
+                }
+              }}
+              disabled={!polygonName.trim()}
+              className="flex-1 px-4 py-2 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+            >
+              Save Name
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+
+    {/* Polygon Context Menu */}
+    {showContextMenu && contextMenuPolygon && (
+      <div 
+        className="fixed bg-white rounded-lg shadow-lg border border-gray-200 py-1 z-[10001]"
+        style={{ 
+          left: contextMenuPosition.x, 
+          top: contextMenuPosition.y,
+          minWidth: '120px'
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          onClick={() => {
+            if (contextMenuPolygon) {
+              deletePolygonAtIndex(contextMenuPolygon.index);
+            }
+          }}
+          className="w-full px-4 py-2 text-sm text-left text-red-600 hover:bg-red-50 hover:text-red-700 transition-colors flex items-center space-x-2"
+        >
+          <span>🗑️</span>
+          <span>Delete "{contextMenuPolygon.name}"</span>
+        </button>
+      </div>
+    )}
+  </div>
   );
 }

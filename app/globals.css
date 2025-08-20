@@ -183,3 +183,19 @@ body {
 .rotate-handle {
   z-index: 1001 !important;
 }
+
+/* Polygon tooltip styles */
+.polygon-tooltip {
+  background: rgba(0, 0, 0, 0.8);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.polygon-tooltip::before {
+  border-top-color: rgba(0, 0, 0, 0.8);
+}
