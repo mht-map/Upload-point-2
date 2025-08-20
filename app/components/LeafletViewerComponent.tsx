@@ -37,13 +37,21 @@ export default function LeafletViewerComponent() {
     bounds: L.LatLngBounds;
     rotation: number;
     transparency: number;
+    floorLevel: string;
     timestamp: number;
+    polygons?: Array<{ latlngs: Array<{ lat: number; lng: number }> }>;
   }>>([]);
   const [activeImageId, setActiveImageId] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isImageLoaded, setIsImageLoaded] = useState(false);
   const [currentImageUrl, setCurrentImageUrl] = useState<string | null>(null);
   const [isInitialLoadComplete, setIsInitialLoadComplete] = useState(false);
+  const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [imageName, setImageName] = useState('');
+  const [selectedFloorLevel, setSelectedFloorLevel] = useState('ground-floor');
+  const [showPolygonTools, setShowPolygonTools] = useState(false);
+  const [isDrawingPolygon, setIsDrawingPolygon] = useState(false);
+  const [drawnPolygons, setDrawnPolygons] = useState<L.Polygon[]>([]);
 
   // Function to load all saved images as overlays (for display purposes)
   const loadAllSavedImagesAsOverlays = useCallback(() => {
@@ -173,6 +181,10 @@ export default function LeafletViewerComponent() {
     if (showRotateHandle) {
       addRotateHandle();
     }
+    
+    // Hide polygon tools when uploading a new image
+    setShowPolygonTools(false);
+    clearAllPolygons();
   };
 
   // Function to calculate visual corners of rotated image
@@ -949,6 +961,8 @@ export default function LeafletViewerComponent() {
       alert('Please select an image file (PNG, JPG, JPEG, etc.)');
       setImageFile(null);
       setImageAspectRatio(1);
+      setShowPolygonTools(false);
+      clearAllPolygons();
       return;
     }
 
@@ -956,6 +970,8 @@ export default function LeafletViewerComponent() {
       alert('File too large. Please select an image under 10MB.');
       setImageFile(null);
       setImageAspectRatio(1);
+      setShowPolygonTools(false);
+      clearAllPolygons();
       return;
     }
 
@@ -1016,6 +1032,8 @@ export default function LeafletViewerComponent() {
       setImageFile(null);
       setImageAspectRatio(1);
       setIsImageLoaded(false);
+      setShowPolygonTools(false);
+      clearAllPolygons();
     } finally {
       setIsUploading(false);
     }
@@ -1217,6 +1235,19 @@ export default function LeafletViewerComponent() {
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [updateHandlePositions]);
 
+  // Function to show save dialog
+  const openSaveDialog = useCallback(() => {
+    if (!imageFile || !imageOverlayRef.current || !currentImageUrl) {
+      alert('No image to save. Please upload an image first.');
+      return;
+    }
+    
+    // Set default name and floor level
+    setImageName(imageFile.name);
+    setSelectedFloorLevel('ground-floor');
+    setShowSaveDialog(true);
+  }, [imageFile, currentImageUrl]);
+
   // Function to save current image
   const saveCurrentImage = useCallback(() => {
     if (!imageFile || !imageOverlayRef.current || !currentImageUrl) {
@@ -1240,6 +1271,8 @@ export default function LeafletViewerComponent() {
       // Update existing saved image
       const updatedImage = {
         ...savedImages[existingImageIndex],
+        name: imageName,
+        floorLevel: selectedFloorLevel,
         bounds: bounds,
         rotation: rotationDegRef.current,
         transparency: transparency,
@@ -1254,16 +1287,17 @@ export default function LeafletViewerComponent() {
       });
       
       setActiveImageId(updatedImage.id);
-      alert(`Image "${imageFile.name}" updated successfully!`);
+      alert(`Image "${imageName}" updated successfully!`);
     } else {
       // Create new saved image
       const newSavedImage = {
         id: `img_${Date.now()}`,
-        name: imageFile.name,
+        name: imageName,
         url: currentImageUrl,
         bounds: bounds,
         rotation: rotationDegRef.current,
         transparency: transparency,
+        floorLevel: selectedFloorLevel,
         timestamp: Date.now()
       };
       
@@ -1274,9 +1308,164 @@ export default function LeafletViewerComponent() {
       });
       
       setActiveImageId(newSavedImage.id);
-      alert(`Image "${imageFile.name}" saved successfully!`);
+      alert(`Image "${imageName}" saved successfully!`);
     }
-  }, [imageFile, transparency, currentImageUrl, savedImages]);
+    
+    // Close dialog and reset form
+    setShowSaveDialog(false);
+    setImageName('');
+    setSelectedFloorLevel('ground-floor');
+  }, [imageFile, transparency, currentImageUrl, savedImages, imageName, selectedFloorLevel]);
+
+  // Polygon drawing functionality
+  const startPolygonDrawing = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    setIsDrawingPolygon(true);
+    
+    // Change map cursor to indicate drawing mode
+    const mapContainer = map.getContainer();
+    mapContainer.style.cursor = 'crosshair';
+    
+    // Create a temporary polygon for drawing
+    const tempPolygon = L.polygon([], {
+      color: '#ff4444',
+      weight: 3,
+      opacity: 0.8,
+      fillColor: '#ff4444',
+      fillOpacity: 0.3
+    });
+
+    let points: L.LatLng[] = [];
+    
+    const onMapClick = (e: L.LeafletMouseEvent) => {
+      points.push(e.latlng);
+      tempPolygon.setLatLngs(points);
+      
+      if (points.length === 1) {
+        tempPolygon.addTo(map);
+      }
+    };
+
+    const onDoubleClick = () => {
+      if (points.length >= 3) {
+        // Finish the polygon
+        const finalPolygon = L.polygon(points, {
+          color: '#ff4444',
+          weight: 3,
+          opacity: 0.8,
+          fillColor: '#ff4444',
+          fillOpacity: 0.3
+        });
+        
+        finalPolygon.addTo(map);
+        setDrawnPolygons(prev => [...prev, finalPolygon]);
+        
+        // Clean up
+        map.off('click', onMapClick);
+        map.off('dblclick', onDoubleClick);
+        tempPolygon.remove();
+        setIsDrawingPolygon(false);
+        
+        // Reset map cursor
+        const mapContainer = map.getContainer();
+        mapContainer.style.cursor = '';
+        
+        // Show instructions
+        alert('Polygon drawn! Double-click to finish drawing.');
+      } else {
+        alert('Polygon needs at least 3 points. Keep clicking to add more points.');
+      }
+    };
+
+    map.on('click', onMapClick);
+    map.on('dblclick', onDoubleClick);
+    
+    // Show instructions
+    alert('Click on the map to add points to your polygon. Double-click to finish drawing.');
+  }, []);
+
+  const clearAllPolygons = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    drawnPolygons.forEach(polygon => {
+      map.removeLayer(polygon);
+    });
+    setDrawnPolygons([]);
+  }, [drawnPolygons]);
+
+  const cancelPolygonDrawing = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    if (isDrawingPolygon) {
+      // Remove any temporary polygon
+      map.eachLayer((layer) => {
+        if (layer instanceof L.Polygon && !drawnPolygons.includes(layer)) {
+          map.removeLayer(layer);
+        }
+      });
+      
+      // Reset drawing state
+      setIsDrawingPolygon(false);
+      
+      // Reset map cursor
+      const mapContainer = map.getContainer();
+      mapContainer.style.cursor = '';
+      
+      // Remove event listeners
+      map.off('click');
+      map.off('dblclick');
+    }
+  }, [isDrawingPolygon, drawnPolygons]);
+
+  const deleteLastPolygon = useCallback(() => {
+    if (drawnPolygons.length === 0) return;
+    
+    const map = mapRef.current;
+    if (!map) return;
+
+    const lastPolygon = drawnPolygons[drawnPolygons.length - 1];
+    map.removeLayer(lastPolygon);
+    setDrawnPolygons(prev => prev.slice(0, -1));
+  }, [drawnPolygons]);
+
+  const savePolygonsToImage = useCallback(() => {
+    if (!activeImageId || drawnPolygons.length === 0) return;
+    
+    const imageIndex = savedImages.findIndex(img => img.id === activeImageId);
+    if (imageIndex === -1) return;
+    
+    // Convert polygons to serializable format
+    const serializablePolygons = drawnPolygons.map(polygon => {
+      const latlngs = polygon.getLatLngs();
+      // Handle different polygon types (simple polygon vs multi-polygon)
+      if (Array.isArray(latlngs) && latlngs.length > 0) {
+        const firstRing = Array.isArray(latlngs[0]) ? latlngs[0] : latlngs;
+        return {
+          latlngs: firstRing.map((latlng: any) => ({
+            lat: latlng.lat,
+            lng: latlng.lng
+          }))
+        };
+      }
+      return { latlngs: [] };
+    });
+    
+    // Update the saved image with polygons
+    setSavedImages(prev => {
+      const newSavedImages = [...prev];
+      newSavedImages[imageIndex] = {
+        ...newSavedImages[imageIndex],
+        polygons: serializablePolygons
+      };
+      return newSavedImages;
+    });
+    
+    alert(`Saved ${drawnPolygons.length} polygon${drawnPolygons.length !== 1 ? 's' : ''} to "${savedImages[imageIndex].name}"`);
+  }, [activeImageId, drawnPolygons, savedImages]);
 
   // Function to load saved image - using same logic as showImage
   const loadSavedImage = useCallback((savedImage: typeof savedImages[0]) => {
@@ -1294,6 +1483,9 @@ export default function LeafletViewerComponent() {
         map.removeLayer(layer);
       }
     });
+    
+    // Clear existing polygons when switching images
+    clearAllPolygons();
 
     // Set up the loaded image for editing - same as fresh upload
     setImageFile(new File([], savedImage.name));
@@ -1331,6 +1523,37 @@ export default function LeafletViewerComponent() {
     addRotateHandle();
 
     setActiveImageId(savedImage.id);
+    
+    // Show polygon tools when viewing saved images
+    setShowPolygonTools(true);
+    
+    // Restore saved polygons if they exist
+    if (savedImage.polygons && savedImage.polygons.length > 0) {
+      // Clear any existing polygons first
+      clearAllPolygons();
+      
+      // Restore saved polygons
+      const restoredPolygons: L.Polygon[] = [];
+      savedImage.polygons.forEach(polyData => {
+        if (polyData.latlngs && polyData.latlngs.length >= 3) {
+          const polygon = L.polygon(polyData.latlngs, {
+            color: '#ff4444',
+            weight: 3,
+            opacity: 0.8,
+            fillColor: '#ff4444',
+            fillOpacity: 0.3
+          });
+          polygon.addTo(map);
+          restoredPolygons.push(polygon);
+        }
+      });
+      
+      setDrawnPolygons(restoredPolygons);
+      console.log(`Restored ${restoredPolygons.length} polygons for ${savedImage.name}`);
+    } else {
+      // Clear any existing polygons
+      clearAllPolygons();
+    }
 
     console.log(`Loaded saved image: ${savedImage.name} - Ready for editing!`);
 
@@ -1409,6 +1632,7 @@ export default function LeafletViewerComponent() {
         // Convert serialized bounds back to L.LatLngBounds objects
         const restoredImages = parsed.map((img: any) => ({
           ...img,
+          floorLevel: img.floorLevel || 'ground-floor', // Provide default for existing images
           bounds: L.latLngBounds(
             [img.bounds._southWest.lat, img.bounds._southWest.lng],
             [img.bounds._northEast.lat, img.bounds._northEast.lng]
@@ -1658,15 +1882,80 @@ export default function LeafletViewerComponent() {
             {imageFile && (
               <div className="mt-4 pt-4 border-t">
                 <button
-                  onClick={saveCurrentImage}
+                  onClick={openSaveDialog}
                   className="w-full px-4 py-2 text-sm transition-colors bg-green-600 text-white hover:bg-green-700"
                 >
                   {activeImageId ? '💾 Update Saved Image' : '💾 Save Image Position'}
                 </button>
                 
                 <p className="text-xs text-gray-500 mt-2">
-                  Save the current image position, rotation, and transparency for later use
+                  Save the current image position, rotation, and transparency with a custom name and floor level
                 </p>
+              </div>
+            )}
+
+            {/* Save Dialog */}
+            {showSaveDialog && (
+              <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[10000]">
+                <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+                  <h3 className="text-lg font-semibold text-gray-800 mb-4">
+                    {activeImageId ? 'Update Saved Image' : 'Save Image'}
+                  </h3>
+                  
+                  <div className="space-y-4">
+                    {/* Image Name Input */}
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                        Image Name
+                      </label>
+                      <input
+                        type="text"
+                        value={imageName}
+                        onChange={(e) => setImageName(e.target.value)}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        placeholder="Enter image name"
+                      />
+                    </div>
+
+                    {/* Floor Level Dropdown */}
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                        Floor Level
+                      </label>
+                      <select
+                        value={selectedFloorLevel}
+                        onChange={(e) => setSelectedFloorLevel(e.target.value)}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      >
+                        <option value="basement">1) Basement</option>
+                        <option value="ground-floor">2) Ground Floor</option>
+                        <option value="floor-1">3) Floor 1</option>
+                        <option value="floor-2">4) Floor 2</option>
+                        <option value="floor-3">5) Floor 3</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="flex space-x-3 mt-6">
+                    <button
+                      onClick={() => {
+                        setShowSaveDialog(false);
+                        setImageName('');
+                        setSelectedFloorLevel('ground-floor');
+                      }}
+                      className="flex-1 px-4 py-2 text-sm border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={saveCurrentImage}
+                      disabled={!imageName.trim()}
+                      className="flex-1 px-4 py-2 text-sm bg-green-600 text-white rounded-md hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+                    >
+                      {activeImageId ? 'Update' : 'Save'}
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -1678,8 +1967,9 @@ export default function LeafletViewerComponent() {
                 <p>2. <strong>Position:</strong> Use Ctrl+drag to move the image</p>
                 <p>3. <strong>Resize:</strong> Show handles and drag corners/edges</p>
                 <p>4. <strong>Rotate:</strong> Show rotate handle and drag to rotate</p>
-                <p>5. <strong>Save:</strong> Click "Save Image Position" to store</p>
+                <p>5. <strong>Save:</strong> Click "Save Image Position" to name and categorize</p>
                 <p>6. <strong>Load:</strong> Click saved images in right sidebar</p>
+                <p>7. <strong>Draw:</strong> Use polygon tools to annotate saved images</p>
               </div>
             </div>
           </div>
@@ -1713,6 +2003,81 @@ export default function LeafletViewerComponent() {
               </label>
             </div>
           </div>
+
+          {/* Polygon Drawing Tools - Bottom Right */}
+          {showPolygonTools && (
+            <div className="absolute bottom-4 right-4 bg-white bg-opacity-95 backdrop-blur-sm rounded-lg shadow-lg p-2 border border-gray-200 z-[1000]">
+              <div className="flex items-center space-x-2">
+                <button
+                  onClick={startPolygonDrawing}
+                  disabled={isDrawingPolygon}
+                  className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                    isDrawingPolygon
+                      ? 'bg-gray-400 text-gray-200 cursor-not-allowed'
+                      : 'bg-blue-600 text-white hover:bg-blue-700'
+                  }`}
+                  title="Draw Polygon"
+                >
+                  ✏️
+                </button>
+                
+                {isDrawingPolygon && (
+                  <button
+                    onClick={cancelPolygonDrawing}
+                    className="px-3 py-1.5 text-xs rounded-md transition-colors bg-yellow-600 text-white hover:bg-yellow-700"
+                    title="Cancel Drawing"
+                  >
+                    ❌
+                  </button>
+                )}
+                
+                <button
+                  onClick={deleteLastPolygon}
+                  disabled={drawnPolygons.length === 0}
+                  className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                    drawnPolygons.length === 0
+                      ? 'bg-gray-400 text-gray-200 cursor-not-allowed'
+                      : 'bg-orange-600 text-white hover:bg-orange-700'
+                  }`}
+                  title="Delete Last Polygon"
+                >
+                  🗑️
+                </button>
+                
+                <button
+                  onClick={clearAllPolygons}
+                  disabled={drawnPolygons.length === 0}
+                  className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                    drawnPolygons.length === 0
+                      ? 'bg-gray-400 text-gray-200 cursor-not-allowed'
+                      : 'bg-red-600 text-white hover:bg-red-700'
+                  }`}
+                  title="Clear All Polygons"
+                >
+                  🧹
+                </button>
+                
+                <button
+                  onClick={savePolygonsToImage}
+                  disabled={drawnPolygons.length === 0 || !activeImageId}
+                  className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                    drawnPolygons.length === 0 || !activeImageId
+                      ? 'bg-gray-400 text-gray-200 cursor-not-allowed'
+                      : 'bg-green-600 text-white hover:bg-green-700'
+                  }`}
+                  title="Save Polygons to Image"
+                >
+                  💾
+                </button>
+              </div>
+              
+              {drawnPolygons.length > 0 && (
+                <div className="text-xs text-gray-600 text-center mt-1 pt-1 border-t">
+                  {drawnPolygons.length} polygon{drawnPolygons.length !== 1 ? 's' : ''}
+                </div>
+              )}
+            </div>
+          )}
 
           {!imageFile && (
             <div className="absolute inset-0 flex items-center justify-center bg-gray-100">
@@ -1822,6 +2187,10 @@ export default function LeafletViewerComponent() {
                   </div>
                   
                   <div className="text-xs text-gray-600 space-y-1">
+                    <div className="flex justify-between">
+                      <span>Floor:</span>
+                      <span className="font-medium">{savedImage.floorLevel?.replace('-', ' ').replace(/\b\w/g, l => l.toUpperCase()) || 'Ground Floor'}</span>
+                    </div>
                     <div className="flex justify-between">
                       <span>Rotation:</span>
                       <span className="font-medium">{Math.round(savedImage.rotation)}°</span>
