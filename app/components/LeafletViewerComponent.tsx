@@ -3,6 +3,13 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import L from 'leaflet';
 
+// Extend HTMLImageElement to include our custom rotation observer
+declare global {
+  interface HTMLImageElement {
+    _rotationObserver?: MutationObserver;
+  }
+}
+
 // Fix Leaflet marker icons for Next.js
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 delete (L.Icon.Default.prototype as any)._getIconUrl;
@@ -17,7 +24,7 @@ export default function LeafletViewerComponent() {
   const containerRef = useRef<HTMLDivElement>(null);
   const imageOverlayRef = useRef<L.ImageOverlay | null>(null);
   const handleMarkersRef = useRef<(L.Marker | null)[]>([]);
-  const resizeStartRef = useRef<{ bounds: L.LatLngBounds; marker: L.Marker } | null>(null);
+  const resizeStartRef = useRef<{ bounds: L.LatLngBounds; center: L.LatLng; rotation: number; marker: L.Marker } | null>(null);
   const rotateHandleRef = useRef<L.Marker | null>(null);
   const rotationDegRef = useRef<number>(0);
   const roadLayerRef = useRef<L.TileLayer | null>(null);
@@ -44,6 +51,8 @@ export default function LeafletViewerComponent() {
       name?: string;
       area?: number;
       unit?: string;
+      roomCategory?: string;
+      roomType?: string;
     }>;
   }>>([]);
   const [activeImageId, setActiveImageId] = useState<string | null>(null);
@@ -57,16 +66,35 @@ export default function LeafletViewerComponent() {
   const [showPolygonTools, setShowPolygonTools] = useState(false);
   const [isDrawingPolygon, setIsDrawingPolygon] = useState(false);
   const [drawnPolygons, setDrawnPolygons] = useState<L.Polygon[]>([]);
-  const [polygonAreas, setPolygonAreas] = useState<Array<{ id: string; name: string; area: number; unit: string }>>([]);
+  const [polygonAreas, setPolygonAreas] = useState<Array<{ 
+    id: string; 
+    name: string; 
+    area: number; 
+    unit: string;
+    roomCategory?: string;
+    roomType?: string;
+  }>>([]);
   const [showPolygonNameDialog, setShowPolygonNameDialog] = useState(false);
   const [polygonName, setPolygonName] = useState('');
   const [polygonToName, setPolygonToName] = useState<{ polygon: L.Polygon; area: number; unit: string } | null>(null);
   const [showContextMenu, setShowContextMenu] = useState(false);
   const [contextMenuPosition, setContextMenuPosition] = useState({ x: 0, y: 0 });
-  const [contextMenuPolygon, setContextMenuPolygon] = useState<{ polygon: L.Polygon; index: number; name: string; polygonId: string } | null>(null);
+  const [contextMenuPolygon, setContextMenuPolygon] = useState<{ polygon: L.Polygon; name: string; polygonId: string } | null>(null);
   const [showImageContextMenu, setShowImageContextMenu] = useState(false);
   const [imageContextMenuPosition, setImageContextMenuPosition] = useState({ x: 0, y: 0 });
   const [imageContextMenuImage, setImageContextMenuImage] = useState<{ id: string; name: string; polygons?: any[] } | null>(null);
+
+  // Room types and uses from CSV
+  const [roomTypes, setRoomTypes] = useState<Array<{ category: string; types: string[] }>>([]);
+  const [selectedRoomCategory, setSelectedRoomCategory] = useState<string>('');
+  const [selectedRoomType, setSelectedRoomType] = useState<string>('');
+  
+  // Room colors from CSV
+  const [roomColors, setRoomColors] = useState<Map<string, string>>(new Map());
+  const [roomColorsLoaded, setRoomColorsLoaded] = useState<boolean>(false);
+  
+  // Editable area for polygon naming dialog
+  const [editableArea, setEditableArea] = useState<number>(0);
 
   // ===== WORKBENCH ARCHITECTURE =====
   
@@ -107,14 +135,43 @@ export default function LeafletViewerComponent() {
     if (uploadMode === 'image') {
       const imgEl = imageOverlayRef.current?.getElement() as HTMLImageElement | undefined;
       if (!imgEl) return;
-      // Force pivot at center
+      
+      // Store the rotation angle in a data attribute for persistence
+      imgEl.setAttribute('data-rotation', deg.toString());
+      
+      // Force pivot at center and ensure rotation is preserved during zoom
       imgEl.style.setProperty('transform-origin', '50% 50%', 'important');
-      // Compose rotation with Leaflet's transform without clobbering it
-      const base = imgEl.style.transform || '';
-      const withoutRotate = base.replace(/\s?rotate\([^)]*\)/, '');
-      imgEl.style.transform = `${withoutRotate} rotate(${deg}deg)`.
-        replace(/\s+/g, ' ').trim();
-      imgEl.style.willChange = 'transform';
+      imgEl.style.setProperty('will-change', 'transform', 'important');
+      
+      // Apply rotation using a more robust method that won't conflict with Leaflet's zoom transforms
+      const applyRotationTransform = () => {
+        const currentTransform = imgEl.style.transform || '';
+        // Remove any existing rotation from the transform
+        const withoutRotate = currentTransform.replace(/\s?rotate\([^)]*\)/, '');
+        // Add our rotation at the end to ensure it's applied last
+        imgEl.style.transform = `${withoutRotate} rotate(${deg}deg)`.replace(/\s+/g, ' ').trim();
+      };
+      
+      // Apply rotation immediately
+      applyRotationTransform();
+      
+      // Also apply rotation after any Leaflet transform changes (like zoom)
+      const observer = new MutationObserver(() => {
+        // Check if Leaflet has modified the transform (e.g., during zoom)
+        const currentTransform = imgEl.style.transform || '';
+        if (!currentTransform.includes(`rotate(${deg}deg)`)) {
+          applyRotationTransform();
+        }
+      });
+      
+      // Observe changes to the style attribute
+      observer.observe(imgEl, { attributes: true, attributeFilter: ['style'] });
+      
+      // Store observer reference for cleanup
+      if (imgEl._rotationObserver) {
+        imgEl._rotationObserver.disconnect();
+      }
+      imgEl._rotationObserver = observer;
       
       // Update handle positions to follow the rotated image
       if (imageOverlayRef.current) {
@@ -263,7 +320,7 @@ export default function LeafletViewerComponent() {
       switch (g.type) {
         case 'Polygon': {
           const rings = makeLatLngRings(g.coordinates as any);
-          const polygon = L.polygon(rings, { color: '#0ea5e9', weight: 2, fillOpacity: 0.2 });
+          const polygon = L.polygon(rings, { color: '#6b7280', weight: 2, fillOpacity: 0.2, fillColor: '#6b7280' });
           polygon.addTo(geoLayerGroupRef.current!);
           featureCount++;
           console.log('renderLocalGeoJSON: Added polygon', { rings: rings.length });
@@ -272,7 +329,7 @@ export default function LeafletViewerComponent() {
         case 'MultiPolygon': {
           (g.coordinates as any).forEach((poly: number[][][]) => {
             const rings = makeLatLngRings(poly);
-            const polygon = L.polygon(rings, { color: '#0ea5e9', weight: 2, fillOpacity: 0.2 });
+            const polygon = L.polygon(rings, { color: '#6b7280', weight: 2, fillOpacity: 0.2, fillColor: '#6b7280' });
             polygon.addTo(geoLayerGroupRef.current!);
             featureCount++;
           });
@@ -576,7 +633,163 @@ export default function LeafletViewerComponent() {
         }
       }
     });
+  }, [savedImages, activeImageId]);
+
+  // Load room types from CSV
+  const loadRoomTypes = useCallback(async () => {
+    try {
+      const response = await fetch('/BB103 and BB104 Room Types and Uses (1).csv');
+      const csvText = await response.text();
+      
+      // Parse CSV - first line contains main room categories (column headers)
+      const lines = csvText.split('\n').filter(line => line.trim());
+      if (lines.length < 2) return;
+      
+      // Simple CSV parsing that handles quoted fields
+      const parseCSVLine = (line: string): string[] => {
+        const result: string[] = [];
+        let current = '';
+        let inQuotes = false;
+        
+        for (let i = 0; i < line.length; i++) {
+          const char = line[i];
+          if (char === '"') {
+            inQuotes = !inQuotes;
+          } else if (char === ',' && !inQuotes) {
+            result.push(current.trim());
+            current = '';
+          } else {
+            current += char;
+          }
+        }
+        result.push(current.trim());
+        return result;
+      };
+      
+      const mainCategories = parseCSVLine(lines[0]).filter(cat => cat && cat.trim().length > 0);
+      const roomTypesData: Array<{ category: string; types: string[] }> = [];
+      
+      // Process each column (main category)
+      mainCategories.forEach((mainCategory, colIndex) => {
+        const subCategories: string[] = [];
+        
+        // Each subsequent row contains sub-categories for this main category
+        for (let rowIndex = 1; rowIndex < lines.length; rowIndex++) {
+          const cells = parseCSVLine(lines[rowIndex]);
+          if (cells[colIndex] && cells[colIndex].length > 0 && cells[colIndex] !== '') {
+            // Clean up the text and only add if it's not just whitespace or empty
+            const cleanText = cells[colIndex].trim().replace(/"/g, '');
+            if (cleanText.length > 0) {
+              subCategories.push(cleanText);
+            }
+          }
+        }
+        
+        // Only add categories that have at least 2 meaningful sub-categories
+        // This filters out categories with mostly empty cells
+        if (subCategories.length >= 2) {
+          // Remove duplicates and filter out any remaining empty strings
+          const uniqueTypes = [...new Set(subCategories)].filter(type => 
+            type && 
+            type.trim().length > 0 && 
+            type !== 'undefined' && 
+            type !== 'null' && 
+            type !== '""' &&
+            !type.startsWith('"') &&
+            !type.endsWith('"')
+          );
+          
+          // Only add if we still have meaningful types after filtering
+          if (uniqueTypes.length >= 2) {
+            roomTypesData.push({ 
+              category: mainCategory, 
+              types: uniqueTypes 
+            });
+          }
+        }
+      });
+      
+      setRoomTypes(roomTypesData);
+      console.log('Loaded room types:', roomTypesData);
+      console.log('Total categories loaded:', roomTypesData.length);
+      console.log('Raw main categories from CSV:', mainCategories);
+      roomTypesData.forEach(cat => {
+        console.log(`Category: "${cat.category}" - ${cat.types.length} types`);
+        console.log('Types:', cat.types);
+      });
+    } catch (error) {
+      console.error('Failed to load room types:', error);
+    }
   }, []);
+
+  // Load room colors from CSV
+  const loadRoomColors = useCallback(async () => {
+    try {
+      const response = await fetch('/room by colour.csv');
+      const csvText = await response.text();
+      
+      // Parse CSV - first line contains main room categories, second line contains colors
+      const lines = csvText.split('\n').filter(line => line.trim());
+      if (lines.length < 2) return;
+      
+      // Simple CSV parsing that handles quoted fields
+      const parseCSVLine = (line: string): string[] => {
+        const result: string[] = [];
+        let current = '';
+        let inQuotes = false;
+        
+        for (let i = 0; i < line.length; i++) {
+          const char = line[i];
+          if (char === '"') {
+            inQuotes = !inQuotes;
+          } else if (char === ',' && !inQuotes) {
+            result.push(current.trim());
+            current = '';
+          } else {
+            current += char;
+          }
+        }
+        result.push(current.trim());
+        return result;
+      };
+      
+      const mainCategories = parseCSVLine(lines[0]).filter(cat => cat && cat.trim().length > 0);
+      const colors = parseCSVLine(lines[1]).filter(color => color && color.trim().length > 0);
+      
+      // Create a map of category to color
+      const colorMap = new Map<string, string>();
+      mainCategories.forEach((category, index) => {
+        if (colors[index] && colors[index].startsWith('#')) {
+          colorMap.set(category, colors[index]);
+        }
+      });
+      
+      setRoomColors(colorMap);
+      setRoomColorsLoaded(true);
+      console.log('=== ROOM COLORS LOADED ===');
+      console.log('Loaded room colors:', colorMap);
+      console.log('Room colors loaded successfully, size:', colorMap.size);
+      console.log('Room colors state updated, triggering re-render');
+      console.log('roomColorsLoaded flag set to true');
+    } catch (error) {
+      console.error('Failed to load room colors:', error);
+    }
+  }, []);
+
+  // Helper function to get polygon color based on room category
+  const getPolygonColor = useCallback((roomCategory: string): string => {
+    // Add additional safety check
+    if (!roomColorsLoaded || roomColors.size === 0) {
+      console.warn(`Room colors not yet loaded for category "${roomCategory}", using default pink`);
+      return '#ff00ff';
+    }
+    
+    const color = roomColors.get(roomCategory);
+    console.log(`Getting color for room category "${roomCategory}":`, color || '#ff00ff (default)');
+    console.log(`Current roomColors size: ${roomColors.size}, available categories:`, Array.from(roomColors.keys()));
+    console.log(`Full roomColors map:`, Object.fromEntries(roomColors));
+    return color || '#ff00ff'; // Default to pink if no color found
+  }, [roomColors, roomColorsLoaded]);
 
   // Initialize Leaflet map
   useEffect(() => {
@@ -619,13 +832,36 @@ export default function LeafletViewerComponent() {
     const onReady = () => map.invalidateSize();
     map.whenReady(onReady);
     window.addEventListener('resize', onReady);
+    
+    // Add zoom event listener to preserve image rotation
+    map.on('zoomend', () => {
+      // Re-apply rotation after zoom to ensure it's preserved
+      if (imageOverlayRef.current && rotationDegRef.current !== 0) {
+        const imgEl = imageOverlayRef.current.getElement() as HTMLImageElement;
+        if (imgEl) {
+          const currentTransform = imgEl.style.transform || '';
+          const withoutRotate = currentTransform.replace(/\s?rotate\([^)]*\)/, '');
+          imgEl.style.transform = `${withoutRotate} rotate(${rotationDegRef.current}deg)`.replace(/\s+/g, ' ').trim();
+        }
+      }
+    });
 
     mapRef.current = map;
+
+    // Load room types and colors when map is ready
+    loadRoomTypes();
+    loadRoomColors();
 
     return () => { 
       window.removeEventListener('resize', onReady); 
       map.remove(); 
       mapRef.current = null;
+      
+      // Clean up rotation handle styles
+      const rotationStyles = document.getElementById('rotation-handle-styles');
+      if (rotationStyles) {
+        rotationStyles.remove();
+      }
     };
   }, []);
 
@@ -636,6 +872,11 @@ export default function LeafletViewerComponent() {
 
     // Remove previous overlay if any
     if (imageOverlayRef.current) {
+      // Clean up rotation observer before removing
+      const imgEl = imageOverlayRef.current.getElement() as HTMLImageElement;
+      if (imgEl && imgEl._rotationObserver) {
+        imgEl._rotationObserver.disconnect();
+      }
       map.removeLayer(imageOverlayRef.current);
     }
 
@@ -806,8 +1047,15 @@ export default function LeafletViewerComponent() {
 
              // Add drag event handlers
        marker.on('dragstart', () => {
+         // Store the current image bounds and center position
+         const currentBounds = imageOverlayRef.current?.getBounds() || getActiveBounds()!;
+         const currentCenter = currentBounds.getCenter();
+         const currentRotation = rotationDegRef.current;
+         
          resizeStartRef.current = { 
-           bounds: getActiveBounds()!, // Use shared function
+           bounds: currentBounds,
+           center: currentCenter,
+           rotation: currentRotation,
            marker 
          };
          marker.getElement()!.style.cursor = 'grabbing';
@@ -819,11 +1067,13 @@ export default function LeafletViewerComponent() {
         if (!resizeStartRef.current) return;
         
         const currentMarker = e.target;
-        const start = resizeStartRef.current.bounds; // Use start bounds here
+        const start = resizeStartRef.current.bounds;
+        const startCenter = resizeStartRef.current.center;
+        const startRotation = resizeStartRef.current.rotation;
         
         // Calculate new bounds based on which corner was dragged
         let newBounds: L.LatLngBounds;
-        const markerIndex = idx; // Use the captured index from closure
+        const markerIndex = idx;
         const currentPos = currentMarker.getLatLng();
         
         // When dragging a corner, only the two edges that meet at that corner should move;
@@ -891,11 +1141,24 @@ export default function LeafletViewerComponent() {
           newBounds = L.latLngBounds(sw, ne);
         }
 
+        // Preserve the center position and rotation during resize
+        const newCenter = newBounds.getCenter();
+        const centerOffset = {
+          lat: startCenter.lat - newCenter.lat,
+          lng: startCenter.lng - newCenter.lng
+        };
+        
+        // Adjust bounds to maintain the original center
+        const adjustedBounds = L.latLngBounds(
+          [newBounds.getSouth() + centerOffset.lat, newBounds.getWest() + centerOffset.lng],
+          [newBounds.getNorth() + centerOffset.lat, newBounds.getEast() + centerOffset.lng]
+        );
+
         // Update bounds using shared function
-        setActiveBounds(newBounds);
+        setActiveBounds(adjustedBounds);
         
         // Re-apply rotation to maintain visual appearance
-        applyRotation(rotationDegRef.current);
+        applyRotation(startRotation);
       });
 
       marker.on('dragend', () => {
@@ -931,8 +1194,15 @@ export default function LeafletViewerComponent() {
 
       // Add drag event handlers for edge handles
       marker.on('dragstart', () => {
+        // Store the current image bounds and center position
+        const currentBounds = imageOverlayRef.current?.getBounds() || getActiveBounds()!;
+        const currentCenter = currentBounds.getCenter();
+        const currentRotation = rotationDegRef.current;
+        
         resizeStartRef.current = { 
-          bounds: getActiveBounds()!, // Use shared function
+          bounds: currentBounds,
+          center: currentCenter,
+          rotation: currentRotation,
           marker 
         };
         marker.getElement()!.style.cursor = 'grabbing';
@@ -945,7 +1215,9 @@ export default function LeafletViewerComponent() {
         
         const currentMarker = e.target;
         const currentPos = currentMarker.getLatLng();
-        const start = resizeStartRef.current.bounds; // Use start bounds here
+        const start = resizeStartRef.current.bounds;
+        const startCenter = resizeStartRef.current.center;
+        const startRotation = resizeStartRef.current.rotation;
         let newBounds: L.LatLngBounds;
         
         // Create new bounds based on which edge was dragged
@@ -978,11 +1250,24 @@ export default function LeafletViewerComponent() {
             return;
         }
 
+        // Preserve the center position and rotation during resize
+        const newCenter = newBounds.getCenter();
+        const centerOffset = {
+          lat: startCenter.lat - newCenter.lat,
+          lng: startCenter.lng - newCenter.lng
+        };
+        
+        // Adjust bounds to maintain the original center
+        const adjustedBounds = L.latLngBounds(
+          [newBounds.getSouth() + centerOffset.lat, newBounds.getWest() + centerOffset.lng],
+          [newBounds.getNorth() + centerOffset.lat, newBounds.getEast() + centerOffset.lng]
+        );
+
         // Update bounds using shared function
-        setActiveBounds(newBounds);
+        setActiveBounds(adjustedBounds);
         
         // Re-apply rotation to maintain visual appearance
-        applyRotation(rotationDegRef.current);
+        applyRotation(startRotation);
       });
 
       marker.on('dragend', () => {
@@ -1338,6 +1623,26 @@ export default function LeafletViewerComponent() {
       rotateHandleRef.current = null;
     }
 
+    // Add CSS styles for rotation handle if not already added
+    if (!document.getElementById('rotation-handle-styles')) {
+      const style = document.createElement('style');
+      style.id = 'rotation-handle-styles';
+      style.textContent = `
+        .rotate-handle {
+          transition: all 0.2s ease;
+        }
+        .rotate-handle:hover {
+          transform: scale(1.1);
+          box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+        }
+        .rotate-handle:active {
+          transform: scale(0.95);
+          box-shadow: 0 2px 6px rgba(59, 130, 246, 0.6);
+        }
+      `;
+      document.head.appendChild(style);
+    }
+
     const bounds = imageOverlayRef.current.getBounds();
     const ll = computeRotateHandleLatLng(bounds);
     if (!ll) return;
@@ -1349,18 +1654,24 @@ export default function LeafletViewerComponent() {
         html: `<div style="
           width: 28px; 
           height: 28px; 
-          background: #10b981; 
+          background: linear-gradient(135deg, #3b82f6, #1d4ed8);
           border: 3px solid white; 
           border-radius: 50%;
           cursor: grab;
           display: flex;
           align-items: center;
           justify-content: center;
-          font-size: 14px;
-          font-weight: bold;
-          color: white;
           box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-        ">🔄</div>`,
+          transition: all 0.2s ease;
+        ">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z" fill="white"/>
+            <path d="M12 6c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm0 10c-2.21 0-4-1.79-4-4s1.79-4 4-4 4 1.79 4 4-1.79 4-4 4z" fill="white"/>
+            <path d="M12 8c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4-1.79-4-4-4zm0 6c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z" fill="white"/>
+            <path d="M12 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z" fill="white"/>
+            <path d="M12 11c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1z" fill="white"/>
+          </svg>
+        </div>`,
         iconSize: [28, 28],
         iconAnchor: [14, 14]
       })
@@ -1813,10 +2124,10 @@ export default function LeafletViewerComponent() {
     
     // Create a temporary polygon for drawing
     const tempPolygon = L.polygon([], {
-      color: '#ff4444',
+      color: '#ff00ff', // Default color, will be updated when room category is selected
       weight: 3,
       opacity: 0.8,
-      fillColor: '#ff4444',
+      fillColor: '#ff00ff', // Default color, will be updated when room category is selected
       fillOpacity: 0.3
     });
 
@@ -1835,10 +2146,10 @@ export default function LeafletViewerComponent() {
       if (points.length >= 3) {
         // Finish the polygon
         const finalPolygon = L.polygon(points, {
-          color: '#ff4444',
+          color: '#ff00ff', // Default color, will be updated when room category is selected
           weight: 3,
           opacity: 0.8,
-          fillColor: '#ff4444',
+          fillColor: '#ff00ff', // Default color, will be updated when room category is selected
           fillOpacity: 0.3
         });
         
@@ -1848,7 +2159,7 @@ export default function LeafletViewerComponent() {
         // Add hover tooltip to the polygon
         const areaData = calculatePolygonArea(finalPolygon);
         finalPolygon.bindTooltip(
-          `Area: ${areaData.area} ${areaData.unit}`,
+          `<div style="font-weight: 600; font-size: 1.1em;">Polygon ${drawnPolygons.length + 1}</div><div style="font-size: 0.9em; color: #6b7280;">Area: ${areaData.area} ${areaData.unit}</div>`,
           { 
             permanent: false, 
             direction: 'top',
@@ -1861,7 +2172,7 @@ export default function LeafletViewerComponent() {
         finalPolygon.on('contextmenu', (e) => {
           const polygonIndex = drawnPolygons.length; // This will be the new polygon's index
           const polygonName = `Polygon ${polygonIndex + 1}`;
-          showPolygonContextMenu(e.originalEvent, finalPolygon, polygonIndex, polygonName, 'temp');
+          showPolygonContextMenu(e.originalEvent, finalPolygon, polygonName, 'temp');
         });
         
         // Add visual feedback for right-click interaction
@@ -1882,6 +2193,7 @@ export default function LeafletViewerComponent() {
         // Show polygon naming dialog
         setPolygonToName({ polygon: finalPolygon, area: areaData.area, unit: areaData.unit });
         setPolygonName('');
+        setEditableArea(areaData.area || 0); // Initialize editable area with calculated value, fallback to 0
         setShowPolygonNameDialog(true);
         
         // Clean up
@@ -2042,22 +2354,21 @@ export default function LeafletViewerComponent() {
     updatePolygonAreas();
   }, [drawnPolygons]);
 
-  // Function to delete a specific polygon by index
-  const deletePolygonAtIndex = useCallback((index: number) => {
-    if (index < 0 || index >= drawnPolygons.length) return;
-    
+  // Function to delete a specific polygon by reference
+  const deletePolygonByReference = useCallback((polygonToDelete: L.Polygon) => {
     const map = mapRef.current;
     if (!map) return;
 
-    const polygonToDelete = drawnPolygons[index];
-    if (!polygonToDelete) return; // Safety check
+    // Find the current index of the polygon in the array
+    const currentIndex = drawnPolygons.findIndex(p => p === polygonToDelete);
+    if (currentIndex === -1) return; // Polygon not found
     
     // Remove from map
     map.removeLayer(polygonToDelete);
     
     // Remove from drawnPolygons array and update areas in one go
     setDrawnPolygons(prev => {
-      const newPolygons = prev.filter((_, i) => i !== index);
+      const newPolygons = prev.filter(p => p !== polygonToDelete);
       
       // Update polygon areas immediately based on new array
       if (newPolygons.length === 0) {
@@ -2090,13 +2401,23 @@ export default function LeafletViewerComponent() {
     setContextMenuPolygon(null);
   }, [drawnPolygons, calculatePolygonArea, polygonAreas]);
 
+  // Function to delete a specific polygon by index (kept for backward compatibility)
+  const deletePolygonAtIndex = useCallback((index: number) => {
+    if (index < 0 || index >= drawnPolygons.length) return;
+    
+    const polygonToDelete = drawnPolygons[index];
+    if (!polygonToDelete) return; // Safety check
+    
+    deletePolygonByReference(polygonToDelete);
+  }, [drawnPolygons, deletePolygonByReference]);
+
   // Function to show context menu for polygon deletion
-  const showPolygonContextMenu = useCallback((e: MouseEvent, polygon: L.Polygon, index: number, name: string, polygonId: string) => {
+  const showPolygonContextMenu = useCallback((e: MouseEvent, polygon: L.Polygon, name: string, polygonId: string) => {
     e.preventDefault();
     e.stopPropagation();
     
     setContextMenuPosition({ x: e.clientX, y: e.clientY });
-    setContextMenuPolygon({ polygon, index, name, polygonId });
+    setContextMenuPolygon({ polygon, name, polygonId });
     setShowContextMenu(true);
   }, []);
 
@@ -2199,7 +2520,9 @@ export default function LeafletViewerComponent() {
           })),
           name: polygonAreas[index]?.name || `Polygon ${index + 1}`,
           area: polygonAreas[index]?.area || 0,
-          unit: polygonAreas[index]?.unit || 'm²'
+          unit: polygonAreas[index]?.unit || 'm²',
+          roomCategory: polygonAreas[index]?.roomCategory,
+          roomType: polygonAreas[index]?.roomType
         };
       }
       return { latlngs: [], name: `Polygon ${index + 1}`, area: 0, unit: 'm²' };
@@ -2230,6 +2553,11 @@ export default function LeafletViewerComponent() {
 
     // Remove current image if any
     if (imageOverlayRef.current) {
+      // Clean up rotation observer before removing
+      const imgEl = imageOverlayRef.current.getElement() as HTMLImageElement;
+      if (imgEl && imgEl._rotationObserver) {
+        imgEl._rotationObserver.disconnect();
+      }
       map.removeLayer(imageOverlayRef.current);
     }
 
@@ -2278,8 +2606,6 @@ export default function LeafletViewerComponent() {
     setShowRotateHandle(true);
     addRotateHandle();
 
-    setActiveImageId(savedImage.id);
-    
     // Show polygon tools when viewing saved images
     setShowPolygonTools(true);
     
@@ -2290,15 +2616,18 @@ export default function LeafletViewerComponent() {
           
           // Restore saved polygons
           const restoredPolygons: L.Polygon[] = [];
-          const restoredAreas: Array<{ id: string; name: string; area: number; unit: string }> = [];
+          const restoredAreas: Array<{ id: string; name: string; area: number; unit: string; roomCategory?: string; roomType?: string }> = [];
         
         savedImage.polygons.forEach((polyData, index) => {
           if (polyData.latlngs && polyData.latlngs.length >= 3) {
+            // Get color based on room category, default to pink if none
+            const polygonColor = polyData.roomCategory ? getPolygonColor(polyData.roomCategory) : '#ff00ff';
+            
             const polygon = L.polygon(polyData.latlngs, {
-              color: '#ff4444',
+              color: polygonColor,
               weight: 3,
               opacity: 0.8,
-              fillColor: '#ff4444',
+              fillColor: polygonColor,
               fillOpacity: 0.3
             });
             
@@ -2308,7 +2637,7 @@ export default function LeafletViewerComponent() {
             // Add right-click context menu for polygon deletion
             polygon.on('contextmenu', (e) => {
               const polygonName = polyData.name || `Polygon ${index + 1}`;
-              showPolygonContextMenu(e.originalEvent, polygon, index, polygonName, 'saved');
+              showPolygonContextMenu(e.originalEvent, polygon, polygonName, 'saved');
             });
             
             // Add visual feedback for right-click interaction
@@ -2330,7 +2659,7 @@ export default function LeafletViewerComponent() {
             if (polyData.area && polyData.unit) {
               const polygonName = polyData.name || `Polygon ${index + 1}`;
               polygon.bindTooltip(
-                `${polygonName}<br>Area: ${polyData.area} ${polyData.unit}`,
+                `<div style="font-weight: 600; font-size: 1.1em;">${polygonName}</div><div style="font-size: 0.9em; color: #6b7280;">Area: ${polyData.area} ${polyData.unit}</div>`,
                 { 
                   permanent: false, 
                   direction: 'top',
@@ -2343,14 +2672,16 @@ export default function LeafletViewerComponent() {
                 id: `polygon_${index}`,
                 name: polygonName,
                 area: polyData.area,
-                unit: polyData.unit
+                unit: polyData.unit,
+                roomCategory: polyData.roomCategory,
+                roomType: polyData.roomType
               });
             } else {
               // Calculate area for polygon without saved data
               const areaData = calculatePolygonArea(polygon);
               const polygonName = polyData.name || `Polygon ${index + 1}`;
               polygon.bindTooltip(
-                `${polygonName}<br>Area: ${areaData.area} ${areaData.unit}`,
+                `<div style="font-weight: 600; font-size: 1.1em;">${polygonName}</div><div style="font-size: 0.9em; color: #6b7280;">Area: ${areaData.area} ${areaData.unit}</div>`,
                 { 
                   permanent: false, 
                   direction: 'top',
@@ -2363,7 +2694,9 @@ export default function LeafletViewerComponent() {
                 id: `polygon_${index}`,
                 name: polygonName,
                 area: areaData.area,
-                unit: areaData.unit
+                unit: areaData.unit,
+                roomCategory: polyData.roomCategory,
+                roomType: polyData.roomType
               });
             }
           }
@@ -2474,22 +2807,6 @@ export default function LeafletViewerComponent() {
         
         setSavedImages(restoredImages);
         
-        // Wait for map to be ready, then display all saved images as overlays
-        if (restoredImages.length > 0) {
-          const checkMapReady = () => {
-            if (mapRef.current && mapRef.current.getSize().x > 0) {
-              console.log('Map ready, loading saved image overlays...');
-              // Display all saved images as non-interactive overlays
-              setTimeout(() => {
-                loadAllSavedImagesAsOverlays();
-              }, 500);
-            } else {
-              setTimeout(checkMapReady, 100);
-            }
-          };
-          checkMapReady();
-        }
-        
         // Mark initial load as complete
         setIsInitialLoadComplete(true);
       } catch (e) {
@@ -2501,6 +2818,65 @@ export default function LeafletViewerComponent() {
       setIsInitialLoadComplete(true);
     }
   }, []);
+
+  // Load active image ID from localStorage on component mount
+  useEffect(() => {
+    console.log('Loading active image ID from localStorage...');
+    const savedActiveId = localStorage.getItem('activeImageId');
+    console.log('localStorage activeImageId:', savedActiveId);
+    
+    if (savedActiveId) {
+      setActiveImageId(savedActiveId);
+    }
+  }, []);
+
+  // Wait for both map and room colors to be ready, then display saved image overlays
+  useEffect(() => {
+    console.log('Checking if ready to load saved image overlays:', {
+      savedImagesLength: savedImages.length,
+      mapReady: !!mapRef.current,
+      mapSize: mapRef.current?.getSize().x || 0,
+      roomColorsSize: roomColors.size,
+      roomColorsLoaded
+    });
+    
+    // Only proceed if we have saved images, the map is ready, and room colors are fully loaded
+    if (savedImages.length > 0 && mapRef.current && mapRef.current.getSize().x > 0 && roomColorsLoaded && roomColors.size > 0) {
+      console.log('Map and room colors ready, loading saved image overlays...');
+      // Display all saved images as non-interactive overlays
+      setTimeout(() => {
+        loadAllSavedImagesAsOverlays();
+      }, 100);
+    }
+  }, [savedImages, roomColors, roomColorsLoaded, mapRef.current]);
+
+  // Load active image when activeImageId changes and room colors are ready
+  useEffect(() => {
+    console.log('Active image useEffect triggered:', {
+      activeImageId,
+      mapReady: !!mapRef.current,
+      roomColorsLoaded,
+      roomColorsSize: roomColors.size,
+      savedImagesLength: savedImages.length
+    });
+    
+    if (activeImageId && mapRef.current && roomColorsLoaded && roomColors.size > 0) {
+      console.log('=== LOADING ACTIVE IMAGE ===');
+      console.log('Loading active image:', activeImageId);
+      const activeImage = savedImages.find(img => img.id === activeImageId);
+      if (activeImage) {
+        console.log('Loading active image immediately');
+        loadSavedImage(activeImage);
+      }
+    } else {
+      console.log('Active image loading conditions not met:', {
+        hasActiveImageId: !!activeImageId,
+        mapReady: !!mapRef.current,
+        roomColorsLoaded,
+        roomColorsSize: roomColors.size
+      });
+    }
+  }, [activeImageId, roomColorsLoaded, roomColors.size, savedImages]);
 
   // Save to localStorage whenever savedImages changes
   useEffect(() => {
@@ -2529,6 +2905,19 @@ export default function LeafletViewerComponent() {
     const saved = localStorage.getItem('savedImages');
     console.log('Verified localStorage save:', saved);
   }, [savedImages, isInitialLoadComplete]);
+
+  // Save activeImageId to localStorage whenever it changes
+  useEffect(() => {
+    if (isInitialLoadComplete) {
+      if (activeImageId) {
+        console.log('Saving activeImageId to localStorage:', activeImageId);
+        localStorage.setItem('activeImageId', activeImageId);
+      } else {
+        console.log('Removing activeImageId from localStorage');
+        localStorage.removeItem('activeImageId');
+      }
+    }
+  }, [activeImageId, isInitialLoadComplete]);
 
 
 
@@ -3165,14 +3554,26 @@ export default function LeafletViewerComponent() {
                   {polygonAreas.length > 0 ? (
                     <>
                       {polygonAreas.map((areaData, index) => (
-                        <div key={areaData.id} className="flex items-center justify-between p-2 bg-blue-50 rounded border border-blue-200">
-                          <div className="flex items-center space-x-2">
-                            <div className="w-3 h-3 bg-red-500 rounded-full"></div>
-                            <span className="text-xs text-gray-600">{areaData.name || `Polygon ${index + 1}`}</span>
+                        <div key={areaData.id} className="flex items-center justify-between p-3 bg-blue-50 rounded border border-blue-200">
+                          <div className="flex flex-col space-y-2 flex-1">
+                            <div className="flex items-center space-x-2">
+                              <div className="w-3 h-3 bg-red-500 rounded-full"></div>
+                              <span className="text-sm font-semibold text-gray-800">
+                                {areaData.name || `Polygon ${index + 1}`}
+                              </span>
+                            </div>
+                            {areaData.roomCategory && areaData.roomType && (
+                              <div className="ml-5 text-xs text-gray-600 border-l-2 border-gray-300 pl-2">
+                                <div className="font-medium text-gray-700">{areaData.roomType}</div>
+                                <div className="text-gray-500 italic">{areaData.roomCategory}</div>
+                              </div>
+                            )}
                           </div>
-                          <span className="text-sm font-medium text-blue-700">
-                            {areaData.area} {areaData.unit}
-                          </span>
+                          <div className="text-right ml-3">
+                            <span className="text-sm font-medium text-blue-700">
+                              {areaData.area} {areaData.unit}
+                            </span>
+                          </div>
                         </div>
                       ))}
                       <div className="text-xs text-gray-500 text-center pt-2">
@@ -3199,29 +3600,106 @@ export default function LeafletViewerComponent() {
       <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[10000]">
         <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
           <h3 className="text-lg font-semibold text-gray-800 mb-4">
-            Name Your Polygon
+            Configure Room Details
           </h3>
           
           <div className="space-y-4">
-            {/* Area Display */}
-            <div className="p-3 bg-blue-50 rounded border border-blue-200">
-              <p className="text-sm text-blue-700">
-                <strong>Area:</strong> {polygonToName?.area} {polygonToName?.unit}
+            {/* Editable Area Input */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Area *
+              </label>
+              <div className="flex items-center space-x-2">
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  value={editableArea}
+                  onChange={(e) => setEditableArea(parseFloat(e.target.value) || 0)}
+                  className={`flex-1 px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-black ${
+                    editableArea < 0.01 ? 'border-red-300 focus:ring-red-500' : 'border-gray-300'
+                  }`}
+                  style={{ color: 'black' }}
+                  placeholder="Enter area value"
+                />
+                <span className="text-sm text-gray-600 px-2 py-2">
+                  {polygonToName?.unit}
+                </span>
+              </div>
+              <p className={`text-xs mt-1 ${editableArea < 0.01 ? 'text-red-500' : 'text-gray-500'}`}>
+                {editableArea < 0.01 
+                  ? 'Please enter a valid area value greater than 0.01'
+                  : `Calculated area: ${polygonToName?.area} ${polygonToName?.unit} (you can adjust this value)`
+                }
               </p>
             </div>
+
+            {/* Instructions */}
+            <div className="p-3 bg-gray-50 rounded border border-gray-200">
+              <p className="text-xs text-gray-600">
+                <strong>Instructions:</strong> Select a room category and type from the BB103/BB104 standards, or enter a custom name below.
+              </p>
+            </div>
+
+            {/* Room Type Selection */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Room Category *
+              </label>
+              <select
+                value={selectedRoomCategory}
+                onChange={(e) => {
+                  setSelectedRoomCategory(e.target.value);
+                  setSelectedRoomType(''); // Reset room type when category changes
+                }}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-black"
+                style={{ color: 'black' }}
+              >
+                <option value="" style={{ color: 'black' }}>Select a room category</option>
+                {roomTypes.map((category, index) => (
+                  <option key={index} value={category.category} style={{ color: 'black' }}>
+                    {category.category}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Room Type Selection */}
+            {selectedRoomCategory && (
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Room Type *
+                </label>
+                <select
+                  value={selectedRoomType}
+                  onChange={(e) => setSelectedRoomType(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-black"
+                  style={{ color: 'black' }}
+                >
+                  <option value="" style={{ color: 'black' }}>Select a room type</option>
+                  {roomTypes
+                    .find(cat => cat.category === selectedRoomCategory)
+                    ?.types.map((type, index) => (
+                      <option key={index} value={type} style={{ color: 'black' }}>
+                        {type}
+                      </option>
+                    ))}
+                </select>
+              </div>
+            )}
 
             {/* Polygon Name Input */}
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">
-                Polygon Name
+                Polygon Name (Optional)
               </label>
               <input
                 type="text"
                 value={polygonName}
                 onChange={(e) => setPolygonName(e.target.value)}
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                placeholder="Enter a name for this polygon"
-                autoFocus
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-black"
+                style={{ color: 'black' }}
+                placeholder="Enter a custom name (optional)"
               />
             </div>
           </div>
@@ -3229,9 +3707,12 @@ export default function LeafletViewerComponent() {
           <div className="flex space-x-3 mt-6">
             <button
               onClick={() => {
-                setShowPolygonNameDialog(false);
-                setPolygonToName(null);
-                setPolygonName('');
+                                  setShowPolygonNameDialog(false);
+                  setPolygonToName(null);
+                  setPolygonName('');
+                  setSelectedRoomCategory('');
+                  setSelectedRoomType('');
+                  setEditableArea(0);
               }}
               className="flex-1 px-4 py-2 text-sm border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 transition-colors"
             >
@@ -3239,35 +3720,65 @@ export default function LeafletViewerComponent() {
             </button>
             <button
               onClick={() => {
-                if (polygonName.trim()) {
-                  // Update the polygon with the name and calculate areas
-                  const finalName = polygonName.trim();
+                if ((selectedRoomType || polygonName.trim()) && editableArea >= 0.01) {
+                  // Use custom name if provided, otherwise use main room category as fallback
+                  const finalName = polygonName.trim() || selectedRoomCategory;
                   const polygonIndex = drawnPolygons.length - 1;
                   
-                  // Update polygon areas with the name
+                  // Update polygon areas with the name, room type info, and edited area
                   setPolygonAreas(prev => {
                     const newAreas = [...prev];
                     if (newAreas[polygonIndex]) {
                       newAreas[polygonIndex] = {
                         ...newAreas[polygonIndex],
-                        name: finalName
+                        name: finalName,
+                        area: editableArea,
+                        roomCategory: selectedRoomCategory,
+                        roomType: selectedRoomType
                       };
                     } else {
                       // If this polygon doesn't have an area entry yet, create one
                       newAreas[polygonIndex] = {
                         id: `polygon_${polygonIndex}`,
                         name: finalName,
-                        area: polygonToName?.area || 0,
-                        unit: polygonToName?.unit || 'm²'
+                        area: editableArea,
+                        unit: polygonToName?.unit || 'm²',
+                        roomCategory: selectedRoomCategory,
+                        roomType: selectedRoomType
                       };
                     }
                     return newAreas;
                   });
                   
-                  // Update tooltip to include name
+                  // Update polygon color based on room category
+                  if (selectedRoomCategory && polygonToName) {
+                    const newColor = getPolygonColor(selectedRoomCategory);
+                    polygonToName.polygon.setStyle({
+                      color: newColor,
+                      fillColor: newColor
+                    });
+                  }
+                  
+                  // Update tooltip to include finalName as main title, room type info, and edited area
                   if (polygonToName) {
+                    let tooltipContent = '';
+                    
+                    // Always use finalName as the main title
+                    tooltipContent = `<div style="font-weight: 600; font-size: 1.1em;">${finalName}</div>`;
+                    
+                    // Add room type and category underneath if available
+                    if (selectedRoomType) {
+                      tooltipContent += `<div style="font-size: 0.9em; color: #6b7280;">${selectedRoomType}</div>`;
+                    }
+                    if (selectedRoomCategory) {
+                      tooltipContent += `<div style="font-size: 0.9em; color: #6b7280;">Category: ${selectedRoomCategory}</div>`;
+                    }
+                    
+                    // Add area at the bottom
+                    tooltipContent += `<div style="font-size: 0.9em; color: #6b7280;">Area: ${editableArea} ${polygonToName.unit}</div>`;
+                    
                     polygonToName.polygon.bindTooltip(
-                      `${finalName}<br>Area: ${polygonToName.area} ${polygonToName.unit}`,
+                      tooltipContent,
                       { 
                         permanent: false, 
                         direction: 'top',
@@ -3282,7 +3793,7 @@ export default function LeafletViewerComponent() {
                   if (namedPolygonIndex !== -1) {
                     polygonToName.polygon.off('contextmenu'); // Remove any existing handler
                     polygonToName.polygon.on('contextmenu', (e) => {
-                      showPolygonContextMenu(e.originalEvent, polygonToName.polygon, namedPolygonIndex, finalName, 'named');
+                      showPolygonContextMenu(e.originalEvent, polygonToName.polygon, finalName, 'named');
                     });
                     
                     // Add visual feedback for right-click interaction
@@ -3307,7 +3818,7 @@ export default function LeafletViewerComponent() {
                   setPolygonName('');
                 }
               }}
-              disabled={!polygonName.trim()}
+              disabled={(!selectedRoomType && !polygonName.trim()) || editableArea < 0.01}
               className="flex-1 px-4 py-2 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
             >
               Save Name
@@ -3331,7 +3842,7 @@ export default function LeafletViewerComponent() {
         <button
           onClick={() => {
             if (contextMenuPolygon) {
-              deletePolygonAtIndex(contextMenuPolygon.index);
+              deletePolygonByReference(contextMenuPolygon.polygon);
             }
           }}
           className="w-full px-4 py-2 text-sm text-left text-red-600 hover:bg-red-50 hover:text-red-700 transition-colors flex items-center space-x-2"
